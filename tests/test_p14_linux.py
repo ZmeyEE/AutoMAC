@@ -1128,11 +1128,11 @@ class TestTiers(unittest.TestCase):
         return led, now
 
     def test_idle_days_per_mac(self):
-        led, now = self._ledger([(A, 0, 5_000_000), (B, 3, 5_000_000), (B, 7, 9_000_000), (C_MAC, 2, 10)])
+        led, now = self._ledger([(A, 0, 500_000_000), (B, 3, 500_000_000), (B, 7, 900_000_000), (C_MAC, 2, 30_000_000)])
         idle = led.idle_days(now)
         self.assertEqual(idle[A], 0)                       # 今天有用
         self.assertEqual(idle[B], 3)                       # 取最近一天，不是最早一天
-        self.assertNotIn(C_MAC, idle)                      # 只有 10 位元組：不算用過；沒有紀錄 = 最久沒用
+        self.assertNotIn(C_MAC, idle)                      # 只有 30 MB（探針與背景流量）：不算用過；沒有紀錄 = 最久沒用
 
     def test_rank_longest_unused_first_just_used_last_then_throttled(self):
         from automac.config import Settings, StateStore
