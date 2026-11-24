@@ -507,5 +507,212 @@ class TestLiveCommand(unittest.TestCase):
             self.assertIn("local.token", err.getvalue())
 
 
+C_MAC = "00005E005303"
+
+
+class TestLeaseRelease(unittest.TestCase):
+    """關機時交還租約：Pi 這類常駐電腦關機後，它持有的 MAC 要能立刻讓別人用。"""
+
+    def hub(self, pool=(A, B, C_MAC)):
+        from tests.test_p8_hub import make_hub
+        hub, s, st, clock, td = make_hub(pool=pool)
+        self.addCleanup(td.cleanup)
+        return hub
+
+    def test_release_only_removes_matching_lease(self):
+        hub = self.hub()
+        hub.report("pi", "pi", A, "192.0.2.5")
+        self.assertFalse(hub.release("pi", B))                          # 不是它持有的 MAC：不動（防止晚到的舊請求刪掉新租約）
+        self.assertEqual([lease.mac for lease in hub.leases()], [A])
+        self.assertTrue(hub.release("pi", A))
+        self.assertEqual(hub.leases(), [])
+        self.assertFalse(hub.release("pi", A))                          # 重複釋放無害
+        self.assertFalse(hub.release("nobody", A))
+
+    def test_freed_mac_becomes_allocatable_immediately(self):
+        from automac.hub import HubError
+        hub = self.hub()
+        hub.report("pi", "pi", A, "192.0.2.5")
+        with self.assertRaises(HubError):
+            hub.allocate("pc", "pc", B, want=A)                          # 持有中：不能分配給別人
+        hub.release("pi", A)
+        self.assertEqual(hub.allocate("pc", "pc", B, want=A), A)         # 釋放後立刻可以，不必等 lease_ttl_s
+
+    def test_release_clears_pending_reservation_too(self):
+        from automac.hub import HubError
+        hub = self.hub()
+        hub.allocate("pi", "pi", B, want=C_MAC)                          # 預約了但還沒換好
+        with self.assertRaises(HubError):
+            hub.allocate("pc", "pc", B, want=C_MAC)
+        hub.release("pi", C_MAC)
+        self.assertEqual(hub.allocate("pc", "pc", B, want=C_MAC), C_MAC)
+
+    def test_http_release_roundtrip_and_old_server_is_tolerated(self):
+        from automac.hub import HubClient, HubError, HubServer
+        from tests.test_p8_hub import CERT, KEY, PIN, TOKEN, HAVE_OPENSSL
+        if not HAVE_OPENSSL:
+            self.skipTest("找不到 openssl")
+        hub = self.hub()
+        srv = HubServer(hub, TOKEN, CERT, KEY, port=0, host="127.0.0.1")
+        srv.start()
+        self.addCleanup(srv.stop)
+        cli_ = HubClient(lambda: f"https://127.0.0.1:{srv.port}", TOKEN, "pi", PIN)
+        cli_.report(A, "192.0.2.5")
+        self.assertEqual([lease.mac for lease in hub.leases()], [A])
+        self.assertTrue(cli_.release(A))
+        self.assertEqual(hub.leases(), [])
+        self.assertFalse(cli_.release(A))                                # 已經釋放過：伺服器回 released=false，不是錯誤
+        bad = HubClient(lambda: f"https://127.0.0.1:{srv.port}", TOKEN, "pi", PIN)
+        with mock.patch.object(HubClient, "_call", side_effect=HubError("伺服器回應 404")):     # 舊版伺服器沒有這個路徑
+            with self.assertRaises(HubError):
+                bad.release(A)
+
+    def _service(self, role="client", dry_run=False):
+        clock = Clock()
+        s = Settings(role=role, hub_token="t" * 32, hub_cert_sha256="a" * 64)
+        s.add_mac(A)
+        svc = Service(s, StateStore(Path(tempfile.mkdtemp()) / "st.json"), FakeNic(A), EventBus(clock=clock), synchronous=True,
+                      sampler=FakeSampler(clock), probe_fn=Probe([GOOD]), scan_fn=lambda: [], clock=clock, wall=clock,
+                      sleep=clock.sleep, dry_run=dry_run)
+        svc.start()
+        return svc
+
+    class Rec:
+        def __init__(self, fail=None):
+            self.released, self.fail = [], fail
+
+        def release(self, mac):
+            if self.fail:
+                raise self.fail
+            self.released.append(mac)
+            return True
+
+        def report(self, *a, **k):
+            raise AssertionError("停止後不該再回報")
+
+    def test_service_stop_releases_current_mac(self):
+        svc = self._service()
+        svc.allocator = self.Rec()
+        svc.stop()
+        self.assertEqual(svc.allocator.released, [A])
+        self.assertTrue(any("已通知伺服器釋放" in e.message for e in svc.bus.recent(50)))
+
+    def test_service_stop_does_not_release_in_other_modes_and_survives_errors(self):
+        from automac.hub import HubUnreachable
+        for role, dry in (("standalone", False), ("client", True)):
+            svc = self._service(role, dry)
+            svc.allocator = self.Rec()
+            svc.stop()
+            self.assertEqual(svc.allocator.released, [], (role, dry))
+        svc = self._service()
+        svc.allocator = self.Rec(fail=HubUnreachable("連不上"))
+        svc.stop()                                                       # 連不上伺服器也不能卡住關機
+        self.assertTrue(any("沒能通知伺服器" in e.message for e in svc.bus.recent(50)))
+
+    def test_sync_after_stop_does_not_report_again(self):
+        svc = self._service()
+        svc.allocator = self.Rec()
+        svc._stop.set()
+        self.assertTrue(svc.sync_once())                                  # Rec.report 會丟 AssertionError：沒被呼叫才會通過
+
+    @unittest.skipUnless(LINUX, "SIGTERM 的行為只在 Linux 驗證")
+    def test_sigterm_is_handled_as_graceful_stop(self):
+        import signal
+        old = signal.getsignal(signal.SIGTERM)
+        self.addCleanup(signal.signal, signal.SIGTERM, old)
+        cli._stop_on_sigterm()
+        with self.assertRaises(KeyboardInterrupt):
+            os.kill(os.getpid(), signal.SIGTERM)
+
+
+class TestBootConflict(unittest.TestCase):
+    """開機避讓：我關機時別台電腦借走了我的 MAC，開機後發現被別人持有，就改要一個沒人用的。"""
+
+    def setUp(self):
+        from tests.test_p8_hub import make_hub
+        self.hub, _, _, self.clock, td = make_hub(pool=(A, B, C_MAC))
+        self.addCleanup(td.cleanup)
+
+    def svc(self, mac=A, role="client", dry_run=False, admin=True):
+        from automac.hub import LocalPort
+        s = Settings(role=role, hub_token="t" * 32, hub_cert_sha256="a" * 64, use_presence=False)
+        for m in (A, B, C_MAC):
+            s.add_mac(m)
+        nic = FakeNic(mac)
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        with mock.patch("automac.service.is_admin", return_value=admin):
+            svc = Service(s, StateStore(Path(td.name) / "st.json"), nic, EventBus(clock=self.clock), synchronous=True,
+                          sampler=FakeSampler(self.clock), probe_fn=Probe([GOOD]), scan_fn=lambda: [], clock=self.clock,
+                          wall=self.clock, sleep=self.clock.sleep, client_id="pi", dry_run=dry_run)
+            svc.start()
+        svc.allocator = LocalPort(self.hub, "pi")
+        return svc, nic
+
+    def test_conflict_when_another_computer_holds_my_mac_then_switches_away(self):
+        self.hub.report("pc", "pc", A, "192.0.2.9")                      # 我關機時別台電腦借走了 A
+        svc, nic = self.svc(A)
+        self.assertTrue(svc.check_boot_conflict())
+        self.assertTrue(svc.maybe_join(conflict=True))
+        self.assertEqual(len(nic.calls), 1)
+        self.assertIn(nic.calls[0], (B, C_MAC))                           # 換到沒人用的，不會是 A
+        self.assertTrue(any("開機時撞到" in e.message for e in svc.bus.recent(50)))
+
+    def test_no_conflict_cases(self):
+        svc, _ = self.svc(A)
+        self.assertFalse(svc.check_boot_conflict())                        # 沒人持有
+        self.hub.report("pi", "pi", A, "192.0.2.5")                        # 持有者就是我自己（服務重啟、沒釋放過）
+        self.assertFalse(svc.check_boot_conflict())
+        self.hub.report("pc", "pc", B, "192.0.2.9")
+        self.assertFalse(svc.check_boot_conflict())                        # 別台持有的是別的 MAC
+        self.hub.s.find(A).fixed = True                                      # 固定占用（監視 Pi 那種）：沒有租約可比，不算衝突
+        self.hub.report("pc", "pc", A, "192.0.2.9")
+        self.assertFalse(svc.check_boot_conflict())
+
+    def test_not_in_pool_is_left_to_normal_join(self):
+        svc, nic = self.svc("00005E0053FF")
+        self.assertFalse(svc.check_boot_conflict())                        # 不在池內：交給原本的自動入網，不算衝突
+        self.assertTrue(svc.maybe_join())
+        self.assertEqual(len(nic.calls), 1)
+
+    def test_unreachable_server_returns_none_and_other_modes_skip(self):
+        from automac.hub import HubUnreachable
+        svc, nic = self.svc(A)
+        svc.allocator = mock.Mock(fetch=mock.Mock(side_effect=HubUnreachable("連不上")))
+        self.assertIsNone(svc.check_boot_conflict())
+        self.assertEqual(nic.calls, [])
+        for kw in ({"role": "standalone"}, {"dry_run": True}):
+            self.hub.report("pc", "pc", A, "192.0.2.9")
+            s2, n2 = self.svc(A, **kw)
+            self.assertFalse(s2.check_boot_conflict(), kw)
+            self.assertEqual(n2.calls, [])
+
+    def test_conflict_without_admin_does_nothing_but_warns(self):
+        self.hub.report("pc", "pc", A, "192.0.2.9")
+        svc, nic = self.svc(A, admin=False)
+        self.assertTrue(svc.check_boot_conflict())
+        self.assertFalse(svc.maybe_join(conflict=True))
+        self.assertEqual(nic.calls, [])
+
+
+class TestPoolSettingsPersist(unittest.TestCase):
+    def test_fixed_flags_and_membership_survive_save_and_load(self):
+        # 伺服器視窗的新增、刪除、切換固定占用都是改 Settings 後存檔；這裡確認存檔再載入不會掉
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "config.json"
+            s = Settings(role="hub")
+            s.add_mac(A, "一般")
+            s.add_mac(B, "監視器", fixed=True)
+            s.add_mac(C_MAC, "要移除")
+            s.remove_mac(C_MAC)
+            s.find(A).fixed = True                                         # 切換固定占用
+            config.save(s, path)
+            back = config.load(path)
+            self.assertEqual([(e.mac, e.label, e.fixed) for e in back.pool], [(A, "一般", True), (B, "監視器", True)])
+            back.find(A).fixed = False
+            config.save(back, path)
+            self.assertFalse(config.load(path).find(A).fixed)
+
+
 if __name__ == "__main__":
     unittest.main()

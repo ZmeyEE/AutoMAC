@@ -148,10 +148,28 @@ class Service:
             self._hub_thread = threading.Thread(target=self._hub_loop, name="automac-hub-sync", daemon=True)
             self._hub_thread.start()
 
+    def _release_lease(self) -> None:
+        """停止服務（關機、重開機、解除安裝、升級重啟）時把租約還給伺服器，MAC 立刻空出，不必等 lease_ttl_s 逾時。
+        只有組員端需要（伺服器自己沒有租約要還）。盡力而為：連不上伺服器、舊版伺服器沒有這個路徑（回 404），
+        都只記一行訊息，不可以拖住關機；租約逾時後一樣會空出。"""
+        release = getattr(self.allocator, "release", None)
+        if self.s.role != "client" or release is None or self.switcher is None or self.dry_run:
+            return
+        try:
+            mac = self.switcher.current_mac()
+            if release(mac):
+                self.bus.emit("info", f"已通知伺服器釋放 {fmt(mac)}，其他電腦可以使用")
+        except Exception as e:
+            self.bus.emit("info", f"沒能通知伺服器釋放租約（{e}）；約 {self.s.lease_ttl_s:.0f} 秒後租約逾時也會空出")
+
     def stop(self) -> None:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=5)
+        hub_thread = getattr(self, "_hub_thread", None)
+        if hub_thread:
+            hub_thread.join(timeout=4)                # 先等同步執行緒收工，免得它在我們釋放之後又回報一次、把租約補回去
+        self._release_lease()
         if self._exec:
             self._exec.shutdown(wait=False, cancel_futures=True)
         if self.hub_server:
@@ -229,8 +247,40 @@ class Service:
             urls += [f"https://{p.ip}:{self.s.hub_port}" for p in self.presence.peers() if p.role == "hub" and p.ip]
         return urls
 
+    def check_boot_conflict(self) -> bool | None:
+        """開機避讓：服務啟動後、第一次回報租約之前，看伺服器登記「我目前的 MAC」是不是被別台電腦持有。
+        情境：Pi 這類常駐電腦關機時交還了租約，別台電腦把它的 MAC 借走；Pi 開機時網卡設定檔仍會套用同一個 MAC，兩台就撞了。
+        偵測到就讓呼叫端馬上改要一個沒人用的（maybe_join(conflict=True)），把網路還給對方。
+        一定要在第一次回報『之前』看：回報之後兩份租約並存，看不出誰先來。固定占用的 MAC（沒有租約）不算衝突。
+        回傳 True（衝突）、False（沒事）、None（連不上伺服器，稍後再試）。
+        shortcut: 網卡設定檔套用 MAC 到服務啟動之間（約 20 到 40 秒）兩台仍會撞；要完全避免只能不在設定檔固定 MAC。"""
+        if self.s.role != "client" or self.dry_run or self.switcher is None or self.allocator is None:
+            return False
+        mac = self.switcher.current_mac()
+        try:
+            view = self.allocator.fetch(mac)
+        except HubError:
+            return None
+        self._apply_view(view)
+        row = next((p for p in view["pool"] if p["mac"] == mac), None)
+        holder = (row or {}).get("holder", "")
+        if not row or row.get("fixed") or not holder or holder == self.client_id:
+            return False
+        self.bus.emit("warn", f"這台電腦的 MAC {fmt(mac)} 目前登記在 {holder} 名下（開機時撞到了），改要一個沒人用的")
+        return True
+
     def _hub_loop(self) -> None:
         self._stop.wait(2.0)                       # 讓網卡與宣告先就緒
+        conflict = False
+        for _ in range(5):                         # 開機時網路與伺服器網址可能還沒好：最多等約 20 秒
+            r = self.check_boot_conflict()
+            if r is not None:
+                conflict = r
+                break
+            if self._stop.wait(4.0):
+                return
+        if conflict:
+            self.maybe_join(conflict=True)
         while not self._stop.is_set():
             self.sync_once()
             self.maybe_join()
@@ -294,8 +344,8 @@ class Service:
     def sync_once(self) -> bool:
         """與伺服器同步一次：組員端抓清單並換掉本機清單，然後回報目前持有的 MAC（刷新租約）。
         伺服器自己只回報。連不上時保留本機快取、只在狀態變化時發一次警告。回傳是否成功。"""
-        if not self.allocator or self.switcher is None or self._switching:
-            return True                       # 切換中網路本來就會斷，不同步也不警告（切換完會立刻同步）
+        if not self.allocator or self.switcher is None or self._switching or self._stop.is_set():
+            return True                       # 切換中網路本來就會斷，不同步也不警告（切換完會立刻同步）；停止中不再回報
         mac, ip = self.switcher.current_mac(), self.nic.current_ip(self.adapter.name) or ""
         try:
             self.allocator.report(mac, ip)                    # 先回報（刷新租約），再抓清單：抓到的視圖才包含自己，標籤立刻對
@@ -365,7 +415,7 @@ class Service:
         used = self.ledger.today()
         return [replace(s, used_rx=used.get(s.mac, (0, 0))[0], used_tx=used.get(s.mac, (0, 0))[1]) for s in sts]
 
-    def maybe_join(self) -> bool:
+    def maybe_join(self, conflict: bool = False) -> bool:
         """入網配發：組員端同步到清單後，若這台電腦目前的 MAC 不在池內（陌生電腦、沒申請的 MAC，
         這種 MAC 多半連不上外網，偵測器只會看到「網路中斷」而不會觸發切換），就主動向伺服器要一個並切換。
         條件：角色是組員端、auto_join 開著、不是試運行、已同步到非空清單、有系統管理員權限。
@@ -375,7 +425,7 @@ class Service:
                 or not self.s.pool or self._hub_view is None):
             return False
         mac = self.switcher.current_mac()
-        if any(e.mac == mac for e in self.s.pool):
+        if any(e.mac == mac for e in self.s.pool) and not conflict:      # conflict=True：MAC 在池內但被別台持有（開機避讓）
             return False
         now = self.wall()
         if now - self._last_join < self.s.join_retry_s or self._busy or self._switching:
@@ -390,7 +440,7 @@ class Service:
         self._last_join = now
         with self._dlock:
             self._busy = True
-        self.bus.emit("info", f"這台電腦的 MAC {fmt(mac)} 不在池內，向伺服器要一個沒人用的並切換")
+        self.bus.emit("info", f"這台電腦的 MAC {fmt(mac)} {'被別台電腦持有' if conflict else '不在池內'}，向伺服器要一個沒人用的並切換")
         self._submit(self._do_join, now)
         return True
 

@@ -344,6 +344,21 @@ def cmd_run(args) -> int:
         release_single_instance(lock)
 
 
+def _stop_on_sigterm() -> None:
+    """把 SIGTERM 當成 Ctrl+C 處理，讓服務走正常的收尾流程（停止取樣、通知伺服器釋放租約、取消 mDNS 宣告）。
+    為什麼：systemd 在關機、重開機、停止服務時送的是 SIGTERM，預設行為是行程立刻結束、什麼都不收尾，
+    租約就只能等 lease_ttl_s 逾時，Pi 關機後它的 MAC 要三分鐘才會空出來。只能在主執行緒設定處理常式。"""
+    import signal
+
+    def _term(signum, frame):
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGTERM, _term)
+    except (ValueError, OSError, AttributeError):
+        pass
+
+
 def _run(args, s, path) -> int:
     if args.auto is not None:
         s.auto_mode = args.auto
@@ -353,6 +368,7 @@ def _run(args, s, path) -> int:
     _lower_priority()
     svc = Service(s, StateStore(), bus=bus, dry_run=args.dry_run, config_path=path)
     end = time.time() + args.duration if args.duration else float("inf")
+    _stop_on_sigterm()
     while True:                                   # 開機時網卡可能還沒好：不要結束，等到找得到網卡為止（排程工作只會重試 5 次）
         try:
             svc.start()
@@ -361,7 +377,10 @@ def _run(args, s, path) -> int:
             bus.emit("warn", f"網卡還沒就緒，30 秒後重試：{e}")
             if time.time() >= end:
                 return 1
-            time.sleep(30)
+            try:
+                time.sleep(30)
+            except KeyboardInterrupt:             # 等網卡時收到停止訊號：服務還沒起來，沒有東西要收尾
+                return 0
     api = None
     if s.local_api:
         from .localapi import LocalServer, load_or_create_token

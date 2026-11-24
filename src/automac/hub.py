@@ -226,6 +226,23 @@ class Hub:
             self._leases[client_id] = Lease(normalize(mac), host, ip, now, "holding")
             self._pending.pop(client_id, None)       # 已經換好（或回報了現況），預約完成
 
+    def release(self, client_id: str, mac: str) -> bool:
+        """組員端關機或停止服務時主動交還租約：它持有的 MAC 立刻空出，不必等 lease_ttl_s（預設 180 秒）逾時。
+        只在租約（或預約）的 MAC 與參數相同時才移除，避免晚到的舊請求把剛換好的新租約刪掉。回傳是否真的移除了租約。
+        shortcut: 空出的是「租約」；若那台電腦的 IP 還留在伺服器的鄰居表（停機後約一分鐘內），掃描仍會把這個 MAC 視為使用中，
+        所以對其他電腦實際可用的時間是租約與鄰居表兩者較晚的那個。"""
+        m = normalize(mac)
+        with self._lock:
+            pend = self._pending.get(client_id)
+            if pend and pend.mac == m:
+                del self._pending[client_id]
+            lease = self._leases.get(client_id)
+            if lease and lease.mac == m:
+                del self._leases[client_id]
+                self._released[(client_id, m)] = (self.wall(), lease.ip)
+                return True
+        return False
+
     def set_device_label(self, client_id: str, label: str) -> None:
         """設定某台電腦的標籤（跟著電腦走，它換到哪個 MAC 就顯示在哪個 MAC 上）。"""
         self.devices.set(client_id, label)
@@ -365,6 +382,8 @@ class HubServer:
                     elif self.path == API + "/report":
                         hub_ref.report(cid, host, mac, b.get("ip", ""), bool(b.get("throttled")))
                         self._send(200, {"ok": True})
+                    elif self.path == API + "/release":
+                        self._send(200, {"ok": True, "released": hub_ref.release(cid, mac)})
                     else:
                         self._send(404, {"error": "未知路徑"})
                 except HubError as e:
@@ -460,6 +479,12 @@ class HubClient:
         self._call("POST", f"{API}/report",
                    {"client": self.client_id, "host": self.host, "mac": mac, "ip": ip, "throttled": throttled})
 
+    def release(self, mac: str) -> bool:
+        """交還租約（服務停止、關機時）。逾時短，因為關機流程不能被它拖住；舊版伺服器沒有這個路徑會回 404（HubError），
+        呼叫端忽略即可，租約逾時後一樣會空出。"""
+        r = self._call("POST", f"{API}/release", {"client": self.client_id, "host": self.host, "mac": mac}, timeout=3.0)
+        return bool(r.get("released"))
+
 
 class LocalPort:
     """伺服器自己的組員端：同樣的介面，直接呼叫 Hub（不經網路，伺服器換 MAC 時也不會斷）。"""
@@ -478,6 +503,9 @@ class LocalPort:
 
     def usage(self, mac: str, rx: int, tx: int) -> None:
         self.hub.add_usage(self.client_id, mac, rx, tx)
+
+    def release(self, mac: str) -> bool:
+        return self.hub.release(self.client_id, mac)
 
 
 __all__ = ["Hub", "HubServer", "HubClient", "LocalPort", "HubError", "HubUnreachable", "HubPinError", "Lease",
