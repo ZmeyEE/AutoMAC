@@ -62,7 +62,11 @@ def _programdata_config() -> Path:
     放在 ProgramData 服務與視窗才讀同一份。舊版組員端（%APPDATA%，角色是 client）已有設定而新位置還沒有時，搬一份過來（只搬一次，不刪舊的）；單機或伺服器的設定不搬。"""
     new = Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData")) / APP_NAME / "config.json"
     old = config_dir() / "config.json"
-    if not new.exists() and old.exists() and _role_of(old) == "client":
+    try:
+        migrate = not new.exists() and old.exists() and _role_of(old) == "client"
+    except OSError:                       # 舊位置不能讀（例如 Linux 的 /var/lib/automac 只有 root 讀得到）：當作沒有可搬的
+        migrate = False
+    if migrate:
         try:
             import shutil
             new.parent.mkdir(parents=True, exist_ok=True)

@@ -85,7 +85,8 @@ def _acquire_flock(name: str):
         d = d or tempfile.gettempdir()
         try:
             os.makedirs(d, mode=0o755, exist_ok=True)
-            fd = os.open(os.path.join(d, safe + ".lock"), os.O_CREAT | os.O_RDWR, 0o600)
+            # O_NOFOLLOW：非 root 時鎖檔會放在 /tmp，別的本機使用者可以先放一個符號連結；不跟隨連結，遇到就改試下一個資料夾
+            fd = os.open(os.path.join(d, safe + ".lock"), os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
         except OSError:
             continue
         try:

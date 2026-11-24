@@ -13,6 +13,10 @@ AutoMAC 會讀取網卡資訊、在區網廣播、替電腦更換網卡 MAC，�
 | 本機其他程式控制服務 | 本機控制介面只綁 127.0.0.1，需要 token 檔（只有管理員與 SYSTEM 可讀），並檢查 Host 標頭防 DNS 重綁定 | 同一台電腦的系統管理員本來就能做任何事 |
 | 惡意設定檔 | 設定檔放在只有管理員可寫的資料夾；`hooks_before` / `hooks_after`（會用 shell 執行命令）**預設不執行**，必須在設定檔明確設 `allow_hooks: true` 才生效；別人遞來的組員設定檔（`automac-client.json`、`automac join`）只接受連線欄位，夾帶的命令與其他欄位一律忽略 | 一旦自己開啟 `allow_hooks`，設定檔就等同可執行程式，請只放自己寫的命令 |
 
+## Linux 組員端
+
+背景服務由 systemd 以 root 啟動（換 MAC 需要 `CAP_NET_ADMIN`），單元檔限制能力、檔案系統與位址族；設定與 token 放在 `/var/lib/automac`（只有 root 讀得到）。安裝腳本以 root 從 PyPI 安裝兩個相依套件，沒有鎖定雜湊，細節與緩解方式見 [docs/隱私與安全檢查.md](docs/隱私與安全檢查.md)。
+
 ## 會對區網揭露的資訊
 
 - **mDNS 宣告**：每台跑本工具的電腦會廣播自己目前使用的 MAC、IP、電腦名稱與狀態，區網內任何人都能看到。

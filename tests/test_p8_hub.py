@@ -8,6 +8,7 @@ import gc
 import io
 import json
 import os
+import ssl
 import tempfile
 import threading
 import time
@@ -767,8 +768,8 @@ class TestTls(unittest.TestCase):
         try:
             conn.request("POST", "/v1/report", body=b"x" * 70000, headers={"X-AutoMAC-Token": TOKEN})
             self.assertEqual(conn.getresponse().status, 413)
-        except (BrokenPipeError, ConnectionResetError):
-            pass          # Linux：伺服器看到過大的內容就回 413 並關線，用戶端還在送資料時被切斷，同樣代表「被拒絕」
+        except (ConnectionError, ssl.SSLError):
+            pass          # 伺服器看到過大的內容就回 413 並關線，用戶端還在送資料時被切斷（Linux 是 BrokenPipe，Windows 偶爾是 SSLEOFError），同樣代表「被拒絕」
         finally:
             conn.close()
 

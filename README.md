@@ -382,7 +382,7 @@ python tools/make_linux_pkg.py --out AutoMAC-Linux.tar.gz --client-json automac-
 tar -xzf AutoMAC-Linux.tar.gz && cd AutoMAC-Linux && ./install.sh
 ```
 
-不是 root 時，`install.sh` 會自動改用 `sudo` 重新執行。腳本最後會確認服務真的在執行並顯示狀態，之後解壓縮的資料夾可以刪除。步驟都寫在檔案開頭的註解。完成後會多出：
+從 `.rar` 解壓縮的檔案沒有執行權限，把 `./install.sh` 改成 `bash install.sh`。不是 root 時，`install.sh` 會自動改用 `sudo` 重新執行。腳本最後會確認服務真的在執行並顯示狀態，之後解壓縮的資料夾可以刪除。步驟都寫在檔案開頭的註解。完成後會多出：
 
 | 位置 | 內容 |
 |---|---|

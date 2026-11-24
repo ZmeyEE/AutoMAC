@@ -11,6 +11,8 @@ AutoMAC Linux 組員包（內含 token，只給實驗室成員，不要上傳或
 
 安裝（一鍵）
     tar -xzf AutoMAC-Linux.tar.gz && cd AutoMAC-Linux && ./install.sh
+- 如果拿到的是 .rar（需要先安裝 unrar 或 7z）：解壓縮後進入 AutoMAC-Linux 資料夾，執行 bash install.sh。
+  .rar 解壓縮後檔案沒有執行權限，所以不能直接 ./install.sh，用 bash 開就可以。
 - 不是 root 會自動改用 sudo（可能要輸入你的密碼）。
 - 腳本最後會確認服務真的在跑並顯示目前狀態。之後這個資料夾可以刪掉，不影響運作。
 - 重複執行是安全的：程式與服務會更新，已有的設定不會被覆蓋。

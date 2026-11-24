@@ -11,6 +11,7 @@
 # 重複執行是安全的：程式與服務會更新，已存在的設定不會被覆蓋。
 # 移除：sudo bash /opt/automac/uninstall.sh（安裝時會把 uninstall.sh 也放進去，解壓縮的資料夾可以刪）
 set -euo pipefail
+umask 022                                  # 不管呼叫者的 umask 是什麼，安裝出來的檔案都不是群組或其他人可寫（服務用 root 執行這裡的程式）
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 DEST=/opt/automac
@@ -69,6 +70,8 @@ echo "[2/5] 建立 Python 環境並安裝 psutil、zeroconf（需要連網）"
 [ -x "$DEST/venv/bin/python" ] || "$PYBIN" -m venv "$DEST/venv"
 "$DEST/venv/bin/pip" install --quiet --disable-pip-version-check "psutil>=5.9" "zeroconf>=0.130" \
     || die "pip 安裝失敗：請確認這台電腦能連到網際網路，再重新執行"
+
+chown -R root:root "$DEST" && chmod -R go-w "$DEST"          # 服務以 root 執行 $DEST 底下的程式，不可被其他人改寫
 
 echo "[3/5] 建立指令 /usr/local/bin/automac"
 cat > /usr/local/bin/automac <<EOF
