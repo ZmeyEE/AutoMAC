@@ -70,6 +70,24 @@ class Ledger:
         with self._lock:
             return {k: {m: (v[0], v[1]) for m, v in self._d[k].items()} for k in keys if k in self._d}
 
+    def idle_days(self, now: float | None = None, min_bytes: int = 1_000_000) -> dict[str, int]:
+        """每個 MAC 距離上次「有用量」（下載加上傳至少 min_bytes）過了幾天：0 = 今天有用，3 = 三天沒用。
+        帳本裡完全沒有紀錄的 MAC 不在結果裡（呼叫者視為最久沒用）。分層級輪替用：最久沒用的優先，剛用完的排後面。"""
+        import datetime
+        t = self.clock() if now is None else now
+        today = datetime.date.fromisoformat(self.day_key(t))
+        out: dict[str, int] = {}
+        with self._lock:
+            for k in sorted(self._d, reverse=True):
+                try:
+                    age = max(0, (today - datetime.date.fromisoformat(k)).days)
+                except ValueError:
+                    continue
+                for m, v in self._d[k].items():
+                    if m not in out and v[0] + v[1] >= min_bytes:
+                        out[m] = age
+        return out
+
     # ---- 內部
     def _prune(self) -> None:
         for k in sorted(self._d)[:-self.keep_days]:

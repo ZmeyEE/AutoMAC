@@ -120,16 +120,17 @@ class Settings:
     probe_low_mbps: float = 2.0          # 探針低於此值算偏慢（限速時約 0.9 Mbps、健康時 256 KB 為 7 到 29 Mbps）
     quiet_window_s: float = 10.0         # 判斷安靜用的視窗（取中位數）
     recent_window_s: float = 3.0         # 最近幾秒也必須安靜，避免剛好在下載尾端探測
-    idle_probe_interval_s: float = 180.0  # 完全沒在用網路時，每幾秒一個探針
+    idle_probe_interval_s: float = 180.0  # 完全沒在用網路（流量幾乎是 0）時，每幾秒一個探針：使用者沒有在等，不必探得頻繁，探針本身也吃額度
+    active_probe_interval_s: float = 30.0  # 有在用網路、但流量低於門檻（被限速的典型狀態）時，每幾秒一個探針：使用者正在等，要快
     confirm_strikes: int = 2             # 連續幾次有效且偏慢才判定限速
-    strike_gap_s: float = 5.0            # 兩次確認探針的最短間隔
+    strike_gap_s: float = 2.0            # 兩次確認探針的最短間隔
     strike_ttl_s: float = 60.0           # 第一次偏慢後多久內沒再確認就作廢
-    invalid_retry_s: float = 10.0        # 探針無效（探測期間有別的流量）後多久再試
+    invalid_retry_s: float = 5.0         # 探針無效（探測期間有別的流量）後多久再試
     flat_low_range: tuple[float, float] = (0.5, 1.8)   # 限速時的特徵：貼在約 1 Mbps
     flat_low_cv: float = 0.25            # 平線的起伏上限
     # --- 探針
     probe_bytes: int = 262144            # 256 KB：限速時約 2 秒，健康時不到 0.5 秒
-    probe_timeout_s: float = 15.0
+    probe_timeout_s: float = 6.0         # 限速時 256 KB 約 2 到 3 秒；超過 6 秒讀不完就是極慢，不必等 15 秒
     probe_urls: list[str] = field(default_factory=lambda: ["https://speed.cloudflare.com/__down"])
     # --- 切換
     min_switch_gap_s: float = 60.0       # 兩次切換最短間隔（給 DHCP 與驗證探針時間）

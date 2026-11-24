@@ -561,11 +561,11 @@ class Service:
 
     def _maybe_quota_switch(self, now: float) -> None:
         """額度規則（使用者要求）：目前 MAC 今天的下載或上傳任一方向達 daily_quota_gb（預設 10 GB），
-        就標記限速（到下次重置）並強制切走，不必等探針偵測。固定占用的 MAC 不適用。每 15 秒檢查一次。"""
+        就標記限速（到下次重置）並強制切走，不必等探針偵測。固定占用的 MAC 不適用。每 5 秒檢查一次。"""
         s = self.s
         if not s.quota_force_switch or s.daily_quota_gb <= 0 or self.switcher is None:
             return
-        if now - getattr(self, "_quota_enf_checked", -1e9) < 15:
+        if now - getattr(self, "_quota_enf_checked", -1e9) < 5:
             return
         self._quota_enf_checked = now
         mac = self.switcher.current_mac()

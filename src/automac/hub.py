@@ -41,7 +41,7 @@ from typing import Callable
 
 from .config import Settings, StateStore, next_quota_reset
 from .macaddr import fmt, normalize
-from .policy import MacStatus, classify, rank_candidates
+from .policy import MacStatus, classify, rank_candidates, tier_text
 from .scanner import Neighbor
 from . import tlsutil
 from .ledger import Ledger
@@ -168,6 +168,7 @@ class Hub:
         self._mark_over_quota(now)
         sts = classify(self.s, self.state, mac, self._in_use(client_id, self._scanned(fresh)), now)
         used = self.ledger.today(now) if self.ledger else {}
+        idle = self.ledger.idle_days(now) if self.ledger else None
         with self._lock:
             self._expire(now)
             holders = {l.mac: cid for cid, l in self._leases.items()}     # 持有中的租約：MAC → 電腦名稱（含發問的這台自己）
@@ -176,8 +177,13 @@ class Hub:
             h = holders.get(x.mac, "")
             # 顯示的標籤：有人持有就顯示「那台電腦的標籤」（沒自訂就是電腦名稱）；沒人持有的固定占用才顯示 MAC 自己的標籤
             label = (self.devices.get(h) or h) if h else (e.label if e.fixed else "")
+            detail = x.detail
+            if x.kind == "free" and idle is not None:
+                detail = tier_text(idle.get(x.mac))                 # 沒人用的：顯示輪替層級（多久沒用）
+            elif x.kind == "throttled":
+                detail = f"{x.detail}，排最後輪替"
             rows.append({"mac": x.mac, "label": label, "plabel": e.label, "holder": h, "fixed": e.fixed, "kind": x.kind,
-                         "detail": x.detail, "until": x.until, "rx": used.get(x.mac, (0, 0))[0],
+                         "detail": detail, "until": x.until, "rx": used.get(x.mac, (0, 0))[0],
                          "tx": used.get(x.mac, (0, 0))[1]})
         return {
             "ts": now,
@@ -223,7 +229,8 @@ class Hub:
                 pick = w
             else:
                 usage = {m: rx + tx for m, (rx, tx) in self.ledger.today(self.wall()).items()} if self.ledger else None
-                cands = rank_candidates(sts, mac, usage)          # 優先今天用得最少的
+                idle = self.ledger.idle_days(self.wall()) if self.ledger else None
+                cands = rank_candidates(sts, mac, usage, idle)    # 最久沒用的優先、剛用完的在後；限速的排最後
                 if not cands:
                     raise HubError("池內沒有可用的 MAC（都在使用中或固定占用）")
                 pick = cands[0]

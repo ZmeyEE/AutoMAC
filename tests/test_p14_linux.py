@@ -1115,6 +1115,69 @@ class TestQuotaRule(unittest.TestCase):
         self.assertEqual(svc2.switcher.auto_switch("throttled").new_mac, C_MAC)                   # 有沒被限速的就不碰限速的
 
 
+class TestTiers(unittest.TestCase):
+    """分層級輪替（使用者要求）：最久沒用的優先，剛用完的拉到最後等其他多日未用的先輪；限速的仍排最後。"""
+    DAY = 86400
+
+    def _ledger(self, rows):
+        from automac.ledger import Ledger
+        now = 1_800_000_000.0
+        led = Ledger(None, 0, clock=lambda: now)
+        for mac, days_ago, rx in rows:
+            led.add(mac, rx, 0, now - days_ago * self.DAY)
+        return led, now
+
+    def test_idle_days_per_mac(self):
+        led, now = self._ledger([(A, 0, 5_000_000), (B, 3, 5_000_000), (B, 7, 9_000_000), (C_MAC, 2, 10)])
+        idle = led.idle_days(now)
+        self.assertEqual(idle[A], 0)                       # 今天有用
+        self.assertEqual(idle[B], 3)                       # 取最近一天，不是最早一天
+        self.assertNotIn(C_MAC, idle)                      # 只有 10 位元組：不算用過；沒有紀錄 = 最久沒用
+
+    def test_rank_longest_unused_first_just_used_last_then_throttled(self):
+        from automac.config import Settings, StateStore
+        from automac.policy import classify, rank_candidates
+        s = Settings()
+        macs = ["00005E005301", "00005E005302", "00005E005303", "00005E005304", "00005E005305", "00005E005306"]
+        for m in macs:
+            s.add_mac(m)
+        with tempfile.TemporaryDirectory() as td:
+            st = StateStore(Path(td) / "st.json")
+            st.mark_throttled(macs[5], 99999)                              # 剛用完額度、被標限速
+            sts = classify(s, st, macs[0], {}, 1000.0)
+            idle = {macs[1]: 0, macs[2]: 5, macs[3]: 1, macs[5]: 0}        # macs[4] 沒有任何紀錄（最久沒用）
+            usage = {macs[1]: 4_000_000_000}
+            self.assertEqual(rank_candidates(sts, macs[0], usage, idle), [macs[4], macs[2], macs[3], macs[1], macs[5]])
+            # 沒有 idle 資料（本機備援）時行為和以前一樣：輪流順序，限速的最後
+            self.assertEqual(rank_candidates(sts, macs[0]), [macs[1], macs[2], macs[3], macs[4], macs[5]])
+
+    def test_hub_allocates_longest_unused_and_shows_tier(self):
+        from tests.test_p8_hub import make_hub
+        from automac.ledger import Ledger
+        hub, s, st, clock, td = make_hub(pool=(A, B, C_MAC))
+        self.addCleanup(td.cleanup)
+        now = hub.wall()
+        hub.ledger = Ledger(Path(td.name) / "usage.json", 0, clock=hub.wall)
+        hub.ledger.add(B, 3_000_000_000, 0, now)                           # B 今天剛用過
+        hub.ledger.add(C_MAC, 2_000_000_000, 0, now - 6 * self.DAY)        # C 六天沒用
+        self.assertEqual(hub.allocate("pc", "pc", A), C_MAC)               # 最久沒用的 C 先輪，不是用量少的 B
+        rows = {p["mac"]: p for p in hub.view("pc", A)["pool"]}
+        self.assertIn("優先（已 6 天未用）", rows[C_MAC]["detail"])
+        self.assertIn("靠後（今天已用）", rows[B]["detail"])
+
+    def test_just_exhausted_mac_waits_behind_longer_idle_ones_even_after_reset(self):
+        # 隔天重置後 B 不再被標限速，但它昨天才用完：仍然排在多日沒用的 C 後面，而不是因為「今天用量 0」又衝到最前面
+        from tests.test_p8_hub import make_hub
+        from automac.ledger import Ledger
+        hub, s, st, clock, td = make_hub(pool=(A, B, C_MAC))
+        self.addCleanup(td.cleanup)
+        now = hub.wall()
+        hub.ledger = Ledger(Path(td.name) / "usage.json", 0, clock=hub.wall)
+        hub.ledger.add(B, 11_000_000_000, 0, now - self.DAY)               # 昨天剛用完
+        hub.ledger.add(C_MAC, 1_500_000_000, 0, now - 5 * self.DAY)        # 五天前用過
+        self.assertEqual(hub.allocate("pc", "pc", A), C_MAC)
+
+
 class TestReleaseIsBounded(unittest.TestCase):
     def test_slow_server_cannot_hold_up_shutdown(self):
         # 伺服器網址有好幾個、各自逾時時，總共最多等約 2.5 秒（量到過：沒上限時停止要多 3 秒以上）

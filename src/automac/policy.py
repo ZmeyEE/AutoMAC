@@ -52,7 +52,22 @@ def classify(settings: Settings, state: StateStore, current_mac: str, in_use: di
     return out
 
 
-def rank_candidates(statuses: list[MacStatus], current_mac: str, usage: dict[str, int] | None = None) -> list[str]:
+NEVER_USED_DAYS = 10 ** 6        # 帳本裡沒有任何紀錄的 MAC：當作最久沒用
+
+
+def tier_text(idle_days: int | None) -> str:
+    """給視窗「說明」欄看的層級：越久沒用越優先。None = 帳本沒有任何紀錄。"""
+    if idle_days is None:
+        return "優先（沒有用量紀錄）"
+    if idle_days >= 3:
+        return f"優先（已 {idle_days} 天未用）"
+    if idle_days >= 1:
+        return f"中（已 {idle_days} 天未用）"
+    return "靠後（今天已用）"
+
+
+def rank_candidates(statuses: list[MacStatus], current_mac: str, usage: dict[str, int] | None = None,
+                    idle: dict[str, int] | None = None) -> list[str]:
     """可選的 MAC，從目前這個的下一個開始繞一圈。目前 MAC 不在池內就從頭開始。
     有用量帳本（usage：MAC → 今天已用位元組）時，在可選的當中優先今天用得最少的；同樣多（例如都還沒用）
     維持輪流順序，所以沒有帳本資料時行為和以前完全一樣。"""
@@ -64,9 +79,13 @@ def rank_candidates(statuses: list[MacStatus], current_mac: str, usage: dict[str
     throttled = {s.mac for s in statuses if s.kind == "throttled"}
     out = [m for m in order if m in free]
     last = [m for m in order if m in throttled]
-    if usage:
-        out.sort(key=lambda m: usage.get(m, 0))              # 穩定排序：同樣用量保持輪流順序
-        last.sort(key=lambda m: usage.get(m, 0))
+    if usage or idle is not None:
+        # 層級（使用者要求）：最久沒用的優先，剛用完的拉到最後；今天用量只是同一層級內的次要排序。
+        # 沒有任何用量紀錄的 MAC 視為最久沒用。穩定排序：同層級同用量時保持輪流順序
+        def key(m: str) -> tuple[int, int]:
+            return (-(idle.get(m, NEVER_USED_DAYS) if idle is not None else 0), (usage or {}).get(m, 0))
+        out.sort(key=key)
+        last.sort(key=key)
     # 被標限速的 MAC 排最後：沒被限速的都輪過了、或都在使用中時才輪到它。這樣每個 MAC 都有機會輪流使用
     # （長期不用可能被學校關掉），又盡量避開限速的（2026-11-24 使用者要求）。固定占用與他人使用中的仍然不選。
     return out + last

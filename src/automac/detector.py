@@ -55,8 +55,9 @@ class Verdict:
 
 class Detector:
     NET_DOWN_BACKOFF_S = 15.0
-    FAST_IDLE_S = 30.0          # 今天用量已超過額度的 MAC：最可能被限速，閒置探測間隔縮短到這麼久
-    FLAT_REPROBE_S = 15.0       # 平線特徵出現時，兩次探測至少隔這麼久，避免連續探
+    FAST_IDLE_S = 10.0          # 今天用量已超過額度的 MAC：最可能被限速，探測間隔縮短到這麼久
+    ACTIVE_MIN_MBPS = 0.2       # 長視窗中位數達這個值就算「有在用網路」（低於門檻的前提下，被限速的典型狀態）
+    FLAT_REPROBE_S = 8.0        # 平線特徵出現時，兩次探測至少隔這麼久，避免連續探
 
     def __init__(self, cfg: DetectorConfig):
         self.cfg = cfg
@@ -131,12 +132,20 @@ class Detector:
         if self._need_verify:
             return "post_switch"
         last = self._last_probe_t
-        interval = min(self.cfg.idle_probe_interval_s, self.FAST_IDLE_S) if self.fast_probe else self.cfg.idle_probe_interval_s
+        # 探測間隔依「使用者有沒有在等」分兩種：完全閒置時慢（沒人在等，探針也吃額度）；有在用但流量低於門檻（被限速的
+        # 典型狀態）時快。2026-11-24 使用者回報限速偵測要分鐘級，太慢。今天用量已達額度的 MAC 更快。
+        w = self._window(t, self.cfg.quiet_window_s)
+        active = bool(w) and median(w) >= self.ACTIVE_MIN_MBPS
+        interval = self.cfg.idle_probe_interval_s
+        if active:
+            interval = min(interval, getattr(self.cfg, "active_probe_interval_s", 30.0))
+        if self.fast_probe:
+            interval = min(interval, self.FAST_IDLE_S)
         healthy_recently = (self._last_healthy_t is not None and t - self._last_healthy_t < interval)
         if self.is_flat_low(t) and not healthy_recently and (last is None or t - last >= self.FLAT_REPROBE_S):
             return "flat_low"
         if last is None or t - last >= interval:
-            return "idle_interval"
+            return "active_interval" if active else "idle_interval"
         return None
 
     # ------------------------------------------------------------------ 結果

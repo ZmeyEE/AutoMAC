@@ -71,10 +71,45 @@ class TestSynthetic(unittest.TestCase):
         self.cfg = Settings()
 
     def test_slow_source_healthy_line_is_not_throttled(self):
-        """對方伺服器只給 1 Mbps（網卡平線約 1），但線路健康：探針正常 → 不是限速，且不會一直重探。"""
+        """對方伺服器只給 1 Mbps（網卡平線約 1），但線路健康：探針正常 → 不是限速（保護完整保留）。
+        有在用網路時最多每 active_probe_interval_s 探一次（為了讓限速偵測快起來），不會連續探。"""
         res = replay(self.cfg, flat(1.0, 120), healthy_model)
         self.assertNotIn("throttled", res.kinds())
-        self.assertEqual(res.kinds(), ["healthy"], f"平線但健康時應只探一次，實際 {res.kinds()}")
+        self.assertEqual(set(res.kinds()), {"healthy"}, f"平線但健康時每次都該是健康，實際 {res.kinds()}")
+        self.assertLessEqual(len(res.probes), 120 / self.cfg.active_probe_interval_s + 1, "探得太頻繁")
+
+    def test_active_low_traffic_probes_at_active_interval_not_idle_interval(self):
+        # 有在用網路（0.6 Mbps）但低於門檻：使用者正在等，探測間隔是 30 秒，不是閒置的 180 秒
+        res = replay(self.cfg, flat(0.6, 200), healthy_model)
+        times = [t for t, *_ in res.probes]
+        self.assertGreaterEqual(len(times), 5)
+        for a, b in zip(times, times[1:]):
+            self.assertAlmostEqual(b - a, self.cfg.active_probe_interval_s, delta=1.5)
+
+    def test_truly_idle_line_still_uses_slow_interval(self):
+        # 流量幾乎是 0（< 0.2 Mbps）：沒人在等，維持 180 秒（探針本身也吃每日額度）
+        res = replay(self.cfg, flat(0.1, 400), healthy_model)
+        self.assertEqual(len(res.probes), 3)
+
+    def test_throttle_is_detected_within_seconds_when_traffic_is_low_but_not_flat(self):
+        # 限速時流量不一定貼成一條平線：這裡在 0.3 到 2.5 Mbps 之間跳動（沒有平線指紋），靠「有在用」的探測間隔
+        s = [(i + 1.0, 0.3 + (i * 7 % 23) / 10.0) for i in range(120)]
+        res = replay(self.cfg, s, throttled_model)
+        t = res.first("throttled")
+        self.assertIsNotNone(t, "限速沒有被偵測到")
+        self.assertLessEqual(t, 30, f"偵測太慢：{t} 秒（使用者回報過分鐘級，太慢）")
+
+    def test_over_quota_mac_is_probed_faster(self):
+        det = Detector(self.cfg)
+        det.fast_probe = True
+        for t in range(1, 15):
+            det.on_sample(float(t), 0.6)
+        self.assertIsNotNone(det.want_probe(14.0))
+        det.on_probe(14.0, ProbeOutcome(True, True, 7.0))                     # 健康
+        for t in range(15, 40):
+            det.on_sample(float(t), 0.6)
+        self.assertIsNone(det.want_probe(20.0))                                # 剛探過 6 秒：還不到
+        self.assertIn(det.want_probe(25.0), ("active_interval", "flat_low"))   # 10 秒後就再探，不等 30 秒（平線時由平線指紋觸發）
 
     def test_idle_checks_at_interval(self):
         res = replay(self.cfg, flat(0.0, 400), healthy_model)
