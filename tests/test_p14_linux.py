@@ -43,16 +43,18 @@ def make_sys(root: Path, name: str, mac="00:00:5e:00:53:01", typ="1", oper="up",
 class Runner:
     """記錄所有被呼叫的指令；可指定哪些指令要失敗。"""
 
-    def __init__(self, fail=(), present=("ip", "nmcli")):
-        self.calls, self.fail, self.present = [], tuple(fail), set(present)
+    def __init__(self, fail=(), present=("ip", "nmcli"), out=None):
+        self.calls, self.fail, self.present, self.out = [], tuple(fail), set(present), dict(out or {})
 
     def which(self, name):
         return f"/usr/bin/{name}" if name in self.present else None
 
     def __call__(self, cmd, **kw):
         self.calls.append([os.path.basename(cmd[0])] + list(cmd[1:]))
-        bad = any(" ".join(self.calls[-1]).startswith(f) for f in self.fail)
-        return subprocess.CompletedProcess(cmd, 1 if bad else 0, "", "boom" if bad else "")
+        line = " ".join(self.calls[-1])
+        bad = any(line.startswith(f) for f in self.fail)
+        stdout = next((v for k, v in self.out.items() if line.startswith(k)), "")
+        return subprocess.CompletedProcess(cmd, 1 if bad else 0, stdout, "boom" if bad else "")
 
 
 class TestLinuxNicRead(unittest.TestCase):
@@ -122,6 +124,7 @@ class TestLinuxSetMac(unittest.TestCase):
         r = Runner()
         self.nic(r).set_mac("eth0", "00-00-5E-00-53-02")
         self.assertEqual(r.calls, [
+            ["nmcli", "-g", "GENERAL.CONNECTION,GENERAL.STATE", "device", "show", "eth0"],     # 沒有啟用中的連線 → 走 ip
             ["ip", "link", "set", "dev", "eth0", "down"],
             ["ip", "link", "set", "dev", "eth0", "address", "00:00:5e:00:53:02"],
             ["ip", "link", "set", "dev", "eth0", "up"],
@@ -148,13 +151,13 @@ class TestLinuxSetMac(unittest.TestCase):
             self.nic(r).set_mac("eth0", B)
         self.assertIn("boom", str(cm.exception))
         self.assertEqual(r.calls[-1], ["ip", "link", "set", "dev", "eth0", "up"])      # 不留下停用的網卡
-        self.assertFalse(any(c[0] == "nmcli" for c in r.calls))
+        self.assertFalse(any(c[:2] == ["nmcli", "-w"] for c in r.calls))
 
     def test_down_failure_stops_early(self):
         r = Runner(fail=("ip link set dev eth0 down",))
         with self.assertRaises(NicError):
             self.nic(r).set_mac("eth0", B)
-        self.assertEqual(len(r.calls), 1)
+        self.assertEqual([c for c in r.calls if c[0] == "ip"], [["ip", "link", "set", "dev", "eth0", "down"]])
 
     def test_missing_ip_binary(self):
         r = Runner(present=())
@@ -180,6 +183,35 @@ class TestLinuxSetMac(unittest.TestCase):
     def test_dhcp_kick_failure_does_not_fail_switch(self):
         r = Runner(fail=("nmcli", "networkctl", "dhcpcd"), present=("ip", "nmcli", "networkctl", "systemctl", "dhcpcd"))
         self.nic(r).set_mac("eth0", B)                                    # 不丟例外
+
+    NM_OUT = {"nmcli -g GENERAL.CONNECTION,GENERAL.STATE device show eth0": "netplan-eth0\n100 (connected)\n"}
+
+    def test_networkmanager_connection_is_modified_instead_of_ip(self):
+        # 連線設了 cloned-mac-address（netplan 的 macaddress）時，用 ip 換的 MAC 會被 NetworkManager 蓋回去，必須改連線設定
+        r = Runner(out=self.NM_OUT)
+        self.nic(r).set_mac("eth0", "00-00-5E-00-53-02")
+        self.assertEqual(r.calls[1:], [
+            ["nmcli", "connection", "modify", "--temporary", "id", "netplan-eth0", "802-3-ethernet.cloned-mac-address", "00:00:5E:00:53:02"],
+            ["nmcli", "-w", "0", "connection", "up", "id", "netplan-eth0", "ifname", "eth0"],
+        ])
+        self.assertFalse(any(c[0] == "ip" for c in r.calls))
+
+    def test_networkmanager_modify_failure_falls_back_to_ip(self):
+        r = Runner(fail=("nmcli connection modify",), out=self.NM_OUT)
+        self.nic(r).set_mac("eth0", B)
+        self.assertIn(["ip", "link", "set", "dev", "eth0", "address", "00:00:5e:00:53:02"], r.calls)
+
+    def test_networkmanager_up_failure_raises(self):
+        r = Runner(fail=("nmcli -w 0 connection up",), out=self.NM_OUT)
+        with self.assertRaises(NicError) as cm:
+            self.nic(r).set_mac("eth0", B)
+        self.assertIn("netplan-eth0", str(cm.exception))
+
+    def test_networkmanager_ignores_unmanaged_and_inactive(self):
+        for out in ("lo\n100 (connected (externally))\n", "--\n30 (disconnected)\n", "\n20 (unavailable)\n", ""):
+            r = Runner(out={"nmcli -g": out})
+            self.nic(r).set_mac("eth0", B)
+            self.assertTrue(any(c[0] == "ip" for c in r.calls), out)
 
     def test_default_backend_by_platform(self):
         with mock.patch.object(sys, "platform", "linux"):
@@ -298,10 +330,20 @@ class TestSystemd(unittest.TestCase):
     def test_cli_install_service_dispatches_on_linux(self):
         cfgp = self.td / "config.json"
         with mock.patch.object(sys, "platform", "linux"), mock.patch.object(svc_linux, "install", return_value=Path("/x/u")) as ins, \
+             mock.patch.dict(os.environ, {"PYTHONPATH": "/opt/automac/lib" + os.pathsep + "/other"}), \
              contextlib.redirect_stdout(io.StringIO()) as out:
             self.assertEqual(cli.main(["--config", str(cfgp), "install-service"]), 0)
-        ins.assert_called_once_with(cfgp)
+        ins.assert_called_once_with(cfgp, pythonpath="/opt/automac/lib")          # 取環境變數第一項，不是目前資料夾
         self.assertIn("automac live", out.getvalue())
+
+    def test_install_uses_given_pythonpath_not_current_directory(self):
+        # 真實 systemd 上踩到：在解壓縮的資料夾裡執行時，用 __file__ 推算會得到暫存資料夾，服務之後 No module named automac
+        r = Runner()
+        unit = svc_linux.install(self.td / "c.json", python="/opt/automac/venv/bin/python", unit_dir=str(self.td / "u"),
+                                 run=r, is_root=True, pythonpath="/opt/automac/lib")
+        text = unit.read_text(encoding="utf-8")
+        self.assertIn('"PYTHONPATH=/opt/automac/lib"', text)
+        self.assertNotIn(self.td.as_posix(), text.split("ExecStart")[0].replace(self.td.as_posix() + "/c.json", ""))
 
 
 class TestConfigPathsLinux(unittest.TestCase):
@@ -405,6 +447,57 @@ class TestLiveCommand(unittest.TestCase):
             srv.stop()
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(cli.main(["--config", str(cfg), "auto", "on"]), 1)    # 服務沒在跑：明確失敗
+
+    def test_switch_command_goes_through_running_service(self):
+        # 服務在跑時，`automac switch` 要請服務去換（同一條路），不能另起程序動網卡
+        from automac.localapi import LocalServer, load_or_create_token
+        with tempfile.TemporaryDirectory() as td:
+            cfg = Path(td) / "config.json"
+            s = Settings(role="client", hub_token="t" * 32, hub_cert_sha256="a" * 64, local_api=True)
+            s.add_mac(A)
+            s.add_mac(B)
+            clock = Clock()
+            nic = FakeNic(A)
+            svc = Service(s, StateStore(Path(td) / "st.json"), nic, EventBus(clock=clock), synchronous=False,
+                          sampler=FakeSampler(clock), probe_fn=Probe([GOOD]), scan_fn=lambda: [], clock=clock,
+                          wall=clock, sleep=clock.sleep, config_path=cfg)
+            svc.start()
+            self.addCleanup(svc.stop)
+            srv = LocalServer(svc, load_or_create_token(Path(td)), port=0)
+            srv.start()
+            self.addCleanup(srv.stop)
+            s.local_port = srv.port
+            config.save(s, cfg)
+            standalone = mock.Mock(side_effect=AssertionError("不該自己切換"))
+            out = io.StringIO()
+            with mock.patch.object(cli, "Switcher", standalone), contextlib.redirect_stdout(out):
+                rc = cli.main(["--config", str(cfg), "switch", "00-00-5E-00-53-02"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(nic.calls, [B])                                   # 服務自己的網卡物件被呼叫
+            self.assertIn("已切換為 00-00-5E-00-53-02", out.getvalue())
+
+    def test_switch_command_reports_service_refusal(self):
+        from automac.localapi import LocalServer, load_or_create_token
+        with tempfile.TemporaryDirectory() as td:
+            cfg = Path(td) / "config.json"
+            s = Settings(role="client", hub_token="t" * 32, hub_cert_sha256="a" * 64)
+            s.add_mac(A)
+            clock = Clock()
+            svc = Service(s, StateStore(Path(td) / "st.json"), FakeNic(A), EventBus(clock=clock), synchronous=True,
+                          sampler=FakeSampler(clock), probe_fn=Probe([GOOD]), scan_fn=lambda: [], clock=clock,
+                          wall=clock, sleep=clock.sleep, config_path=cfg)
+            svc.start()
+            srv = LocalServer(svc, load_or_create_token(Path(td)), port=0)
+            srv.start()
+            self.addCleanup(srv.stop)
+            s.local_port = srv.port
+            config.save(s, cfg)
+            svc._switching = True                                              # 模擬服務正在切換
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                rc = cli.main(["--config", str(cfg), "switch", "00-00-5E-00-53-01"])
+            self.assertEqual(rc, 1)
+            self.assertIn("切換進行中", err.getvalue())
 
     def test_live_without_token_file(self):
         with tempfile.TemporaryDirectory() as td:

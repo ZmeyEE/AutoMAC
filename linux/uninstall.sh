@@ -1,5 +1,5 @@
 #!/bin/bash
-# 用途：移除 AutoMAC 的 Linux 組員端（服務、程式、設定）。用法：sudo bash uninstall.sh
+# 用途：移除 AutoMAC 的 Linux 組員端（服務、程式、設定）。用法：sudo bash /opt/automac/uninstall.sh（或解壓縮資料夾裡的 uninstall.sh）
 # MAC 清單、標籤與用量都記在伺服器上，刪掉本機資料不會遺失紀錄。
 # 注意：換過的 MAC 不會自動換回，重開機後網卡會回到硬體原本的 MAC。
 set -u

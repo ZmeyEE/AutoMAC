@@ -278,12 +278,53 @@ class LinuxNic:
         m = check_assignable(mac)
         if not self._is_root():
             raise NicError("換 MAC 需要 root 權限，請用 sudo 執行（背景服務由 systemd 以 root 啟動）")
+        if self._nm_set_mac(name, m):
+            return
         self._ip("link", "set", "dev", name, "down")
         try:
             self._ip("link", "set", "dev", name, "address", fmt(m, ":").lower())
         finally:
             self._ip("link", "set", "dev", name, "up", check=False)        # 位址設失敗也要拉起來
         self._kick_dhcp(name)
+
+    def _nmcli(self, *args: str):
+        return self._run(["nmcli", *args], capture_output=True, text=True, timeout=30)
+
+    def _nm_connection(self, name: str) -> str | None:
+        """裝置由 NetworkManager 管理且有啟用中的連線時，回傳連線名稱；其他情況（沒裝、沒在跑、裝置不歸它管、
+        「外部設定」的 lo 之類）回傳 None。`nmcli -g` 依序輸出連線名稱與狀態兩行，狀態 100 = 已連線。"""
+        if not self._which("nmcli"):
+            return None
+        try:
+            cp = self._nmcli("-g", "GENERAL.CONNECTION,GENERAL.STATE", "device", "show", name)
+        except Exception:
+            return None
+        lines = (cp.stdout or "").splitlines()
+        if cp.returncode != 0 or len(lines) < 2:
+            return None
+        conn, state = lines[0].strip(), lines[1].strip()
+        if not conn or conn == "--" or not state.startswith("100") or "externally" in state:
+            return None
+        return conn
+
+    def _nm_set_mac(self, name: str, m: str) -> bool:
+        """NetworkManager 的做法：暫時（不寫進磁碟）把啟用中連線的 cloned-mac-address 改成目標位址，再重新啟用連線。
+        為什麼不能只用 ip link set：連線若設了 cloned-mac-address（netplan 的 macaddress 就會產生，實驗室的 Pi 就是），
+        網卡 down/up 或重新連線時 NetworkManager 會把 MAC 蓋回設定值，換了等於沒換。透過連線設定改，它自己會套用並重新取址。
+        --temporary：只改記憶體裡的連線，重開機或重載後回到原本設定（與 ip 做法「重開機後回硬體位址」一致）。
+        成功回傳 True；沒有這個途徑（沒有 NetworkManager、連線不是有線）回傳 False 由呼叫端退回 ip；
+        連線已改但重新啟用失敗丟 NicError（Switcher 會用原 MAC 再呼叫一次復原）。
+        shortcut: 換回原 MAC 時 cloned-mac-address 會留著「原 MAC」這個明確值直到重開機，不還原成 preserve／未設定。"""
+        conn = self._nm_connection(name)
+        if not conn:
+            return False
+        mac_s = fmt(m, ":").upper()
+        if self._nmcli("connection", "modify", "--temporary", "id", conn, "802-3-ethernet.cloned-mac-address", mac_s).returncode != 0:
+            return False
+        cp = self._nmcli("-w", "0", "connection", "up", "id", conn, "ifname", name)       # -w 0：不等啟用完成，由 wait_ready 等
+        if cp.returncode != 0:
+            raise NicError(f"NetworkManager 重新啟用連線 {conn!r} 失敗：{(cp.stderr or cp.stdout or '').strip()[:300]}")
+        return True
 
     def _kick_dhcp(self, name: str) -> None:
         """叫網路管理程式重新取址（盡力而為，失敗不影響換 MAC 本身；拿不到位址由 wait_ready 逾時並換回）。

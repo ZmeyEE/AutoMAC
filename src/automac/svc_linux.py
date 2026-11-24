@@ -75,9 +75,12 @@ def _systemctl(run, *args: str, check: bool = True) -> subprocess.CompletedProce
 
 
 def install(config_path: Path, python: str | None = None, unit_dir: str = UNIT_DIR, run=None,
-            start: bool = True, is_root: bool | None = None) -> Path:
+            start: bool = True, is_root: bool | None = None, pythonpath: str | None = None) -> Path:
     """安裝（或升級）並啟動服務。回傳單元檔路徑。任何一步失敗丟 RuntimeError（訊息可直接給使用者看）。
-    重複執行安全：單元檔直接覆寫、systemctl enable 本來就是冪等的。"""
+    重複執行安全：單元檔直接覆寫、systemctl enable 本來就是冪等的。
+    pythonpath：套件所在資料夾，寫進單元的 PYTHONPATH。不給就用本檔案往上兩層推算。
+    為什麼要能指定：`python -m automac` 會優先載入「目前資料夾」裡的 automac，在解壓縮的資料夾裡執行時，
+    推算出來的是那個暫存資料夾，資料夾一刪或根本沒搬進去，服務就 No module named automac（2026-11-24 在真實 systemd 上踩到）。"""
     run = run or subprocess.run
     root = is_root if is_root is not None else (getattr(os, "geteuid", lambda: -1)() == 0)
     if not root:
@@ -88,7 +91,7 @@ def install(config_path: Path, python: str | None = None, unit_dir: str = UNIT_D
         os.chmod(config_path.parent, 0o700)           # 內含 token 與憑證指紋
     except OSError:
         pass
-    pkg_root = Path(__file__).resolve().parent.parent.as_posix()
+    pkg_root = pythonpath or Path(__file__).resolve().parent.parent.as_posix()
     py = python or sys.executable
     unit = Path(unit_dir) / UNIT
     unit.parent.mkdir(parents=True, exist_ok=True)

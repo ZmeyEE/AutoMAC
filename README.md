@@ -358,7 +358,7 @@ Linux 組員端沒有視窗與系統匣，只有背景服務。功能與 Windows
 需求：
 
 - 有 systemd 的發行版（Debian、Ubuntu、Raspberry Pi OS）
-- Python 3.11 以上、`python3-venv`、`iproute2`
+- Python 3.11 以上；`iproute2` 與 `python3-venv` 缺少時，安裝腳本會用 `apt` 或 `dnf` 自動補裝
 - 安裝時要連網（`pip` 下載 `psutil` 與 `zeroconf`）
 - 有線網卡；無線網卡不支援
 
@@ -368,15 +368,13 @@ Linux 組員端沒有視窗與系統匣，只有背景服務。功能與 Windows
 python tools/make_linux_pkg.py --out AutoMAC-Linux.tar.gz --client-json automac-client.json
 ```
 
-組員安裝：
+組員安裝（一行完成）：
 
 ```bash
-tar -xzf AutoMAC-Linux.tar.gz
-cd AutoMAC-Linux
-sudo bash install.sh
+tar -xzf AutoMAC-Linux.tar.gz && cd AutoMAC-Linux && ./install.sh
 ```
 
-`install.sh` 的步驟都寫在檔案開頭的註解。完成後會多出：
+不是 root 時，`install.sh` 會自動改用 `sudo` 重新執行。腳本最後會確認服務真的在執行並顯示狀態，之後解壓縮的資料夾可以刪除。步驟都寫在檔案開頭的註解。完成後會多出：
 
 | 位置 | 內容 |
 |---|---|
@@ -384,6 +382,7 @@ sudo bash install.sh
 | `/var/lib/automac/` | 設定、token、狀態與日誌，權限 0700 |
 | `/etc/systemd/system/automac-client.service` | 開機啟動的服務，只保留換 MAC 需要的權限 |
 | `/usr/local/bin/automac` | 指令 |
+| `/opt/automac/uninstall.sh` | 移除腳本 |
 
 常用指令（都要 `sudo`，因為 token 只有 root 讀得到）：
 
@@ -392,15 +391,15 @@ sudo bash install.sh
 | `sudo automac live` | 服務目前狀態、與伺服器同步狀況、最近事件 |
 | `sudo automac status` | 網卡與池內各 MAC 的狀態（會掃描區網） |
 | `sudo automac auto on` / `off` | 開關「被限速時自動切換」，等於 Windows 視窗的勾選方塊；設定會存檔 |
-| `sudo automac switch [MAC]` | 手動切換；不給 MAC 由伺服器挑 |
+| `sudo automac switch [MAC]` | 手動切換；不給 MAC 由伺服器挑。背景服務在跑時由服務去切換，不另起程序 |
 | `journalctl -u automac-client -f` | 即時日誌 |
-| `sudo bash uninstall.sh` | 移除服務、程式與本機設定 |
+| `sudo bash /opt/automac/uninstall.sh` | 移除服務、程式與本機設定 |
 
 與 Windows 版的差異：
 
 | 項目 | Windows | Linux |
 |---|---|---|
-| 換 MAC | 寫登錄並重啟網卡驅動 | `ip link set` 的 down、address、up，再通知 NetworkManager、systemd-networkd 或 dhcpcd 重新取址 |
+| 換 MAC | 寫登錄並重啟網卡驅動 | 裝置由 NetworkManager 管理時，暫時修改連線的 `cloned-mac-address` 再重新啟用連線；否則用 `ip link set` 的 down、address、up，再通知 systemd-networkd 或 dhcpcd 重新取址 |
 | 鄰居掃描 | PowerShell 的鄰居表 | `/proc/net/arp`（清空鄰居表用 `ip neigh flush`，需要 root） |
 | 單一執行個體 | 具名互斥鎖 | `flock` 鎖檔 |
 | 重開機後 | 登錄值保留，MAC 維持 | 網卡回到硬體 MAC，服務開機後再向伺服器要一個 |
@@ -545,7 +544,7 @@ $env:PYTHONPATH = "src"
 python -m unittest discover -s tests -t .
 ```
 
-目前共有 **276 項測試**，涵蓋：
+目前共有 **283 項測試**，涵蓋：
 
 - 正常網路、限速及使用者下載的真實樣本重播。
 - 隨機忙碌流量持續兩小時，確認沒有誤觸探針。
@@ -592,11 +591,11 @@ python -m automac hub init --new-token
 9. **登入後系統匣圖示：** 重開機後圖示是否能正常自動出現，尚未完成實機驗證。
 10. **解除安裝：** GUI 解除安裝按鈕的完整實機操作流程，尚未完成驗證。
 11. **多帳號環境：** 同一台電腦有多個 Windows 使用者帳號時，背景服務與系統匣的行為尚未完成驗證。
-12. **Linux 實體網卡尚未實測：** Linux 組員端的實機測試在 Raspberry Pi（Debian 13）上進行，沒有 root，所以改在無特權網路命名空間內，對虛擬網卡執行真實的 `ip link set`、鄰居表與伺服器端對端流程。實體網卡改 MAC 後的驅動行為、DHCP 重新取址（NetworkManager、systemd-networkd、dhcpcd 的通知）只用假指令測試過。
-13. **Linux 服務單元：** 單元通過 `systemd-analyze verify`，沙盒選項在使用者層級的 systemd 測試過，沒有以 root 實際安裝啟動過。`install.sh` 在命名空間內以假的 `systemctl` 完整執行過一次。
-14. **Linux 版沒有連過實驗室的真實伺服器：** 端對端測試用同一命名空間內的測試伺服器；連線、憑證釘選與 token 驗證與 Windows 版共用同一份程式。
-15. **Linux 取址程式：** 使用 ifupdown 加 `dhclient` 的舊系統，網卡 down 再 up 後不一定會重新取址，換 MAC 會逾時並換回原 MAC。NetworkManager 連線若設定了 `cloned-mac-address`，重新連線時會蓋掉換過的 MAC，需改成 `preserve`。
-16. **Linux 版需要 Python 3.11 以上：** Ubuntu 22.04 內建 3.10，需要另外安裝新版 Python。
+12. **Linux 只在一種環境實測過：** Raspberry Pi 4（Debian 13、aarch64、NetworkManager 1.52、Python 3.13、systemd 257）連真實伺服器。其他發行版、x86 電腦，以及 systemd-networkd、dhcpcd、ifupdown 加 `dhclient` 的取址方式，只用假指令測試過。
+13. **`install.sh` 自動補裝系統套件的路徑沒有實測：** 測試機已具備所有套件，`apt`、`dnf` 補裝只檢查過語法與邏輯。
+14. **NetworkManager 的暫時設定：** 換 MAC 時修改的是記憶體中的連線設定，重開機後回到原本設定值（實測會回到 netplan 的設定）。換回原 MAC 後，`cloned-mac-address` 會保留成明確值，直到重開機。
+15. **Linux 版需要 Python 3.11 以上：** Ubuntu 22.04 內建 3.10，需要另外安裝新版 Python。
+16. **用 SSH 管理 Linux 組員端時：** MAC 綁定 IP，換 MAC 後 IP 會變，原本的 SSH 連線會中斷。可改用 mDNS 名稱（`主機名稱.local`）重新連線。
 
 ## 15. 授權
 

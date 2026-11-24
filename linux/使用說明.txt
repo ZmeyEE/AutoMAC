@@ -4,15 +4,16 @@ AutoMAC Linux 組員包（內含 token，只給實驗室成員，不要上傳或
 想看狀態用指令（下面有）；要用視窗請用 Windows 版。
 
 需求
-- 有 systemd 的 Linux（Debian、Ubuntu、Raspberry Pi OS、Fedora）、Python 3.11 以上、ip 指令（iproute2）。
-- Debian / Ubuntu 另外需要 python3-venv：sudo apt install python3-venv
+- 有 systemd 的 Linux（Debian、Ubuntu、Raspberry Pi OS、Fedora）、Python 3.11 以上。
 - 安裝時需要連網（pip 會下載 psutil 與 zeroconf，約 1 MB）。
 - 只支援有線網卡；無線網卡不支援。
+- ip 指令、python3、python3-venv 缺的話，安裝腳本會用 apt 或 dnf 自動補裝（會先告訴你裝了什麼）。
 
-安裝
-1. 解壓縮：tar -xzf AutoMAC-Linux.tar.gz，進入資料夾（automac-client.json 與 install.sh 在同一層）。
-2. 執行：sudo bash install.sh
-3. 腳本結束時會顯示服務狀態。之後這個資料夾可以刪掉，不影響運作。
+安裝（一鍵）
+    tar -xzf AutoMAC-Linux.tar.gz && cd AutoMAC-Linux && ./install.sh
+- 不是 root 會自動改用 sudo（可能要輸入你的密碼）。
+- 腳本最後會確認服務真的在跑並顯示目前狀態。之後這個資料夾可以刪掉，不影響運作。
+- 重複執行是安全的：程式與服務會更新，已有的設定不會被覆蓋。
 
 安裝腳本做的事（都在 install.sh 裡，可以先讀）
 - 程式放 /opt/automac；設定與 token 放 /var/lib/automac（只有 root 讀得到）；建立指令 /usr/local/bin/automac。
@@ -31,12 +32,12 @@ AutoMAC Linux 組員包（內含 token，只給實驗室成員，不要上傳或
 
 手動換 MAC
 - sudo automac auto on|off         開關「被限速時自動切換」（等於 Windows 版視窗裡的勾選方塊）
-- sudo automac switch              由伺服器挑一個沒人用的
+- sudo automac switch              由伺服器挑一個沒人用的（背景服務在跑時，由服務去換，不會另起程序）
 - sudo automac switch 00:00:5e:00:53:21    指定
 - 換 MAC 只改目前運作中的網卡，不寫進設定：重開機後網卡回到硬體原本的 MAC，服務開機後會再自動入網。
 
 移除
-- sudo bash uninstall.sh（停止服務、刪程式與本機設定）。MAC 清單、標籤與用量都在伺服器上，不會遺失。
+- sudo bash /opt/automac/uninstall.sh（停止服務、刪程式與本機設定；解壓縮的資料夾刪掉了也能用這個）。MAC 清單、標籤與用量都在伺服器上，不會遺失。
 
 注意
 - 換 MAC 時網路會中斷。若你是用 SSH 連到這台機器，連線會斷幾秒，之後自己會恢復（IP 可能變）。

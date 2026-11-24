@@ -255,8 +255,42 @@ def cmd_usage(args) -> int:
     return 0
 
 
+def _switch_via_service(args, s: Settings, path: Path) -> int | None:
+    """背景服務在跑時，請它去切換（和視窗同一條路），不另起程序動網卡。服務沒在跑回傳 None，由呼叫端自己切換。
+    為什麼：服務有自己的切換旗標、取樣器與宣告，另一個程序同時換 MAC，兩邊會互相打架（網卡被換兩次、用量基準錯亂）。
+    等待方式：輪詢事件直到出現「已切換為」（成功）或服務的切換旗標放下（失敗），並把過程事件印出來。"""
+    import urllib.error
+    call = _local_caller(s, path, quiet=True)
+    if call is None:
+        return None
+    try:
+        seq = call("/v1/status")["seq"]
+    except (urllib.error.URLError, OSError, ValueError, KeyError):
+        return None                                           # 服務沒在跑或 token 不符：自己切換
+    r = call("/v1/switch", {"mac": normalize(args.mac) if args.mac else None, "force": bool(args.force)})
+    if not r.get("accepted"):
+        print(f"失敗：{r.get('detail') or '服務拒絕了這次切換'}", file=sys.stderr)
+        return 1
+    t0, ok = time.time(), False
+    while time.time() - t0 < s.adapter_wait_s + 60:
+        time.sleep(0.5)
+        try:
+            for e in call(f"/v1/events?since={seq}")["events"]:
+                seq = max(seq, e["seq"])
+                print(f"{time.strftime('%H:%M:%S', time.localtime(e['ts']))} [{e['kind']}] {e['message']}", flush=True)
+                ok = ok or (e["kind"] == "switch" and e["message"].startswith("已切換為"))
+            if ok or (time.time() - t0 > 2 and not call("/v1/status")["status"].get("switching")):
+                break
+        except (urllib.error.URLError, OSError, ValueError, KeyError):
+            time.sleep(1)                                     # 換 MAC 的瞬間本機連線理論上不會斷，保險起見重試
+    return 0 if ok else 1
+
+
 def cmd_switch(args) -> int:
-    s, _ = _load(args)
+    s, path = _load(args)
+    via = _switch_via_service(args, s, path)
+    if via is not None:
+        return via
     bus = EventBus()
     bus.subscribe(_print_event)
     n = nicmod.default_backend()
@@ -374,7 +408,9 @@ def cmd_install_service(args) -> int:
     s, path = _load(args)
     if sys.platform.startswith("linux"):
         from . import svc_linux
-        unit = svc_linux.install(path)
+        import os
+        pp = (os.environ.get("PYTHONPATH") or "").split(os.pathsep)[0]       # 安裝腳本的 automac 指令會設成 /opt/automac/lib
+        unit = svc_linux.install(path, pythonpath=pp or None)
         print(f"背景服務已安裝並啟動：{unit}")
         print(f"查看狀態：automac live    日誌：journalctl -u {svc_linux.UNIT} -f")
         return 0
@@ -407,15 +443,16 @@ def cmd_uninstall_service(args) -> int:
     return 0
 
 
-def _local_caller(s: Settings, path: Path):
-    """回傳 call(路徑, 內容=None)：帶 token 呼叫本機背景服務的控制介面；讀不到 token 檔就印出原因並回傳 None。
+def _local_caller(s: Settings, path: Path, quiet: bool = False):
+    """回傳 call(路徑, 內容=None)：帶 token 呼叫本機背景服務的控制介面；讀不到 token 檔就印出原因（quiet 則不印）並回傳 None。
     GET 不給內容、POST 給字典。token 檔只有 root 讀得到，所以組員端的指令要用 sudo。"""
     from .localapi import LOCAL_HOST, TOKEN_FILE, TOKEN_HEADER
     import urllib.request
     try:
         tok = (path.parent / TOKEN_FILE).read_text(encoding="ascii").strip()
     except OSError:
-        print(f"讀不到 {path.parent / TOKEN_FILE}：背景服務還沒執行過，或需要用 sudo 執行。", file=sys.stderr)
+        if not quiet:
+            print(f"讀不到 {path.parent / TOKEN_FILE}：背景服務還沒執行過，或需要用 sudo 執行。", file=sys.stderr)
         return None
 
     def call(p: str, body: dict | None = None):
