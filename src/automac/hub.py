@@ -200,7 +200,7 @@ class Hub:
                 st = next((x for x in sts if x.mac == w), None)
                 if st is None:
                     raise HubError(f"{fmt(w)} 不在 MAC 池內")
-                if st.kind != "free":
+                if st.kind not in ("free", "throttled"):             # 已知限速只是「自動挑選時避開」的建議；使用者明確指定就照辦
                     why = KIND_WHY[st.kind] + (f"（{st.detail}）" if st.detail and st.kind != "fixed" else "")
                     raise HubError(f"{fmt(w)} 目前不可用：{why}")
                 pick = w
@@ -225,6 +225,14 @@ class Hub:
                 self._released[(client_id, prev.mac)] = (now, prev.ip)
             self._leases[client_id] = Lease(normalize(mac), host, ip, now, "holding")
             self._pending.pop(client_id, None)       # 已經換好（或回報了現況），預約完成
+
+    def unthrottle(self, mac: str) -> bool:
+        """清除某個 MAC 的限速標記（全員共用的那一份）。標記只會因為「到期」或「有人清除」消失；誤判或限速提前結束時，
+        沒有這個就只能等到隔天重置。回傳原本是否有標記。各台電腦的客戶端下次同步（約 30 秒）會跟著清掉本機的副本。"""
+        m = normalize(mac)
+        had = self.state.throttled_until_of(m, self.wall()) is not None
+        self.state.clear_throttled(m)
+        return had
 
     def release(self, client_id: str, mac: str) -> bool:
         """組員端關機或停止服務時主動交還租約：它持有的 MAC 立刻空出，不必等 lease_ttl_s（預設 180 秒）逾時。
@@ -384,6 +392,8 @@ class HubServer:
                         self._send(200, {"ok": True})
                     elif self.path == API + "/release":
                         self._send(200, {"ok": True, "released": hub_ref.release(cid, mac)})
+                    elif self.path == API + "/unthrottle":
+                        self._send(200, {"ok": True, "cleared": hub_ref.unthrottle(mac)})
                     else:
                         self._send(404, {"error": "未知路徑"})
                 except HubError as e:
@@ -485,6 +495,10 @@ class HubClient:
         r = self._call("POST", f"{API}/release", {"client": self.client_id, "host": self.host, "mac": mac}, timeout=3.0)
         return bool(r.get("released"))
 
+    def unthrottle(self, mac: str) -> bool:
+        """請伺服器清除某個 MAC 的限速標記（誤判時用）。舊版伺服器沒有這個路徑，會回 HubError「未知路徑」。"""
+        return bool(self._call("POST", f"{API}/unthrottle", {"client": self.client_id, "host": self.host, "mac": mac}).get("cleared"))
+
 
 class LocalPort:
     """伺服器自己的組員端：同樣的介面，直接呼叫 Hub（不經網路，伺服器換 MAC 時也不會斷）。"""
@@ -506,6 +520,9 @@ class LocalPort:
 
     def release(self, mac: str) -> bool:
         return self.hub.release(self.client_id, mac)
+
+    def unthrottle(self, mac: str) -> bool:
+        return self.hub.unthrottle(mac)
 
 
 __all__ = ["Hub", "HubServer", "HubClient", "LocalPort", "HubError", "HubUnreachable", "HubPinError", "Lease",

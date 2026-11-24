@@ -113,7 +113,8 @@ class App(tk.Tk):
         # 先放右側的按鈕欄與捲軸，再讓清單吃掉剩餘空間；否則清單太寬時會把按鈕欄擠成一個字寬
         btns = ttk.Frame(mid)
         btns.pack(side="right", fill="y", padx=8, pady=8)
-        edit = [("新增…", self._add), ("刪除所選", self._remove), ("編輯標籤…", self._edit_label), ("切換固定占用", self._toggle_fixed)]
+        edit = [("新增…", self._add), ("刪除所選", self._remove), ("編輯標籤…", self._edit_label), ("切換固定占用", self._toggle_fixed),
+                ("清除限速標記", self._clear_throttle)]
         self._switch_btns = []
         self._switch_text = {}
         # 切換按鈕在最上面，自動挑選又在切換到所選之上（使用者要求：自動挑選是主要操作）
@@ -208,12 +209,14 @@ class App(tk.Tk):
         self.tree.pack(side="left", fill="both", expand=True)
         if not client:
             self.tree.bind("<Double-1>", lambda _e: self._edit_label())
-            # 伺服器／單機才有的清單管理按鈕（組員端的清單由伺服器管理，不放任何改清單的按鈕）
-            edit = tk.Frame(mid, bg=BG)
-            edit.pack(fill="x", pady=(6, 0))
-            for text, cmd in (("新增…", self._add), ("刪除所選", self._remove), ("編輯標籤…", self._edit_label),
-                              ("切換固定占用", self._toggle_fixed), ("重新掃描", lambda: self.refresh_pool(force=True))):
-                RoundButton(edit, text, cmd, bg=SMALL, hover=SMALL_HOVER, size=9, bold=False, width=96, height=28, radius=10).pack(side="left", padx=(0, 6))
+        # 清單下方的小按鈕列。伺服器／單機有清單管理按鈕；組員端的清單由伺服器管理，不放任何改清單的按鈕，只有清除限速標記
+        edit = tk.Frame(mid, bg=BG)
+        edit.pack(fill="x", pady=(6, 0))
+        manage = [] if client else [("新增…", self._add), ("刪除所選", self._remove), ("編輯標籤…", self._edit_label),
+                                    ("切換固定占用", self._toggle_fixed), ("重新掃描", lambda: self.refresh_pool(force=True))]
+        for text, cmd in (*manage, ("清除限速標記", self._clear_throttle)):
+            RoundButton(edit, text, cmd, bg=SMALL, hover=SMALL_HOVER, size=9, bold=False, width=104 if "限速" in text else 92,
+                        height=28, radius=10).pack(side="left", padx=(0, 6))
 
         # 4) 控制列
         ctl = tk.Frame(self, bg=BG)
@@ -332,6 +335,24 @@ class App(tk.Tk):
             except Exception as e:
                 self._refreshing = False
                 self.bus.emit("error", f"更新池內狀態失敗：{e}")
+        th = threading.Thread(target=work, daemon=True)
+        self._threads = [x for x in getattr(self, "_threads", []) if x.is_alive()] + [th]
+        th.start()
+
+    def _clear_throttle(self) -> None:
+        """清除所選 MAC 的限速標記：偵測誤判、或限速提早結束時用。標記是全員共用的，組員端會請伺服器清；
+        要連網，放到背景執行緒。"""
+        mac = self._selected_mac()
+        if not mac:
+            messagebox.showinfo("清除限速標記", "請先在清單中點選要清除標記的那一列。", parent=self)
+            return
+
+        def work():
+            try:
+                self.svc.clear_throttle(mac)
+                self._q.put(("pool", self.svc.pool_statuses(max_age_s=0.0, force=True)))
+            except Exception as e:
+                self.bus.emit("error", f"清除限速標記失敗：{e}")
         th = threading.Thread(target=work, daemon=True)
         self._threads = [x for x in getattr(self, "_threads", []) if x.is_alive()] + [th]
         th.start()
@@ -495,6 +516,12 @@ class App(tk.Tk):
         self.auto_var = None
 
     def _close(self) -> None:
+        """先讓視窗消失，再停服務與收背景執行緒：收尾要數百毫秒到數秒（背景掃描、等伺服器回應），
+        使用者不該對著一個凍結的視窗等（2026-11-24 回報：每次關閉都很卡）。"""
+        try:
+            self.withdraw()
+        except Exception:
+            pass
         try:
             self.svc.stop()
         finally:

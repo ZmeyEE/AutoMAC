@@ -17,6 +17,7 @@
     automac install-service|uninstall-service   背景服務的安裝與移除（Windows：排程工作；Linux：systemd 單元，需 root）
     automac live                   Linux 無視窗版：讀背景服務的即時狀態與最近事件
     automac auto on|off            Linux 無視窗版：開關「被限速時自動切換」
+    automac unthrottle <MAC>       清除某個 MAC 的限速標記（偵測誤判，或限速提早結束時）
 
 Linux 組員端沒有視窗與系統匣：用 `sudo automac install-service` 裝成 systemd 服務，之後用 `automac live` 或 journalctl 看狀況。
 """
@@ -520,6 +521,27 @@ def cmd_live(args) -> int:
     return 0
 
 
+def cmd_unthrottle(args) -> int:
+    """清除某個 MAC 的限速標記（偵測誤判、或限速提早結束時用）。背景服務在跑就請它清：組員端會連伺服器清掉全員共用的那份，
+    各台電腦約 30 秒內跟著清；服務沒在跑就只清這台電腦的狀態檔（伺服器上的標記沒動，要說清楚）。"""
+    import urllib.error
+    s, path = _load(args)
+    mac = normalize(args.mac)
+    call = _local_caller(s, path, quiet=True)
+    if call is not None:
+        try:
+            r = call("/v1/unthrottle", {"mac": mac})
+            print(f"已清除 {fmt(mac)} 的限速標記" if r.get("cleared") else f"{fmt(mac)} 原本就沒有限速標記")
+            return 0
+        except (urllib.error.URLError, OSError, ValueError):
+            pass
+    st = StateStore(path.with_name("state.json"))
+    had = st.throttled_until_of(mac, time.time()) is not None
+    st.clear_throttled(mac)
+    print(f"背景服務沒在跑，只清了這台電腦的狀態檔（{'原本有標記' if had else '原本就沒有標記'}）；伺服器上的標記沒有動。")
+    return 0
+
+
 def cmd_gui(args) -> int:
     from .gui import main as gui_main
     if getattr(sys, "frozen", False):                # 視窗已經開著就帶到最前面，不再開第二個（伺服器的接手模式會停背景服務，兩個視窗會互相打架）
@@ -602,6 +624,9 @@ def build_parser() -> argparse.ArgumentParser:
     lv = sub.add_parser("live", help="讀背景服務的即時狀態與最近事件（無視窗）")
     lv.add_argument("--lines", type=int, default=15, help="顯示最近幾筆事件")
     lv.set_defaults(fn=cmd_live)
+    ut = sub.add_parser("unthrottle", help="清除某個 MAC 的限速標記（偵測誤判時用）")
+    ut.add_argument("mac")
+    ut.set_defaults(fn=cmd_unthrottle)
     au = sub.add_parser("auto", help="開關「被限速時自動切換」（無視窗版；需背景服務在跑）")
     au.add_argument("value", choices=["on", "off"])
     au.set_defaults(fn=cmd_auto)

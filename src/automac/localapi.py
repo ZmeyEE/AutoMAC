@@ -136,6 +136,8 @@ class LocalServer:
                     elif self.path == "/v1/auto":
                         svc.set_auto(bool(b.get("on")))
                         self._send(200, {"ok": True})
+                    elif self.path == "/v1/unthrottle":
+                        self._send(200, {"ok": True, "cleared": svc.clear_throttle(b.get("mac", ""))})
                     else:
                         self._send(404, {"error": "未知路徑"})
                 except (ValueError, KeyError) as e:
@@ -249,6 +251,9 @@ class LocalClient:
 
     def set_auto(self, on: bool) -> None:
         self._call("POST", "/v1/auto", {"on": on})
+
+    def clear_throttle(self, mac: str) -> bool:
+        return bool(self._call("POST", "/v1/unthrottle", {"mac": mac}).get("cleared"))
 
     def stop(self) -> None:
         """關視窗：只停掉自己的輪詢，背景服務繼續跑。"""

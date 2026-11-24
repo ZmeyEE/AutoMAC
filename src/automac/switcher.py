@@ -98,6 +98,9 @@ class Switcher:
         old = self.current_mac()
         if target == old:
             raise SwitchError("已經是這個 MAC")
+        until = self.state.throttled_until_of(target, self.clock())
+        if until:                                   # 限速標記只是「自動挑選時避開」的建議；使用者明確指定就照辦，但說一聲
+            self.bus.emit("warn", f"{fmt(target)} 先前被標為限速（約 {time.strftime('%m/%d %H:%M', time.localtime(until))} 恢復），照你的選擇切換")
         hub_ok = False
         if self.allocator and not force:
             try:
@@ -106,7 +109,12 @@ class Switcher:
             except HubUnreachable as e:
                 self.bus.emit("warn", f"{e}；改用本機掃描檢查")
             except HubError as e:
-                raise SwitchError(str(e)) from e
+                # 舊版伺服器連「使用者手動指定」的限速標記 MAC 也拒絕。限速標記只是自動挑選時避開的建議，
+                # 手動指定就照辦：改用本機的掃描與宣告檢查（和伺服器連不上時同一套），仍然擋「別人正在用」。
+                if until and "限速" in str(e):
+                    self.bus.emit("warn", "伺服器因限速標記拒絕這次手動切換，依你的選擇改用本機檢查繼續")
+                else:
+                    raise SwitchError(str(e)) from e
         return self._switch(target, old, reason, force, claim=not hub_ok, check_busy=not hub_ok)
 
     def _switch(self, target: str, old: str, reason: str, force: bool, claim: bool = True,

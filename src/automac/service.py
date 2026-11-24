@@ -29,7 +29,7 @@ from .events import EventBus
 from .ledger import Ledger
 from .devices import DeviceLabels
 from .hub import Hub, HubClient, HubError, HubServer, HubUnreachable, LocalPort
-from .macaddr import fmt
+from .macaddr import fmt, normalize
 from .policy import MacStatus, rank_candidates
 from .probe import ProbeResult, run_probe
 from .scanner import scan as scan_subnet
@@ -117,7 +117,7 @@ class Service:
         if self.sampler is None:
             self.sampler = TrafficSampler(self.adapter.name, self.s.sample_interval_s)
         if self._scan_fn is None:
-            self._scan_fn = lambda: scan_subnet(self.adapter.name, own_mac=self.nic.current_mac(self.adapter.name))
+            self._scan_fn = lambda: scan_subnet(self.adapter.name, own_mac=self.nic.current_mac(self.adapter.name), stop=self._stop)
         if self.presence is None and self.s.use_presence:
             self.presence = self._make_presence()
         if self.s.role != "client":
@@ -155,12 +155,23 @@ class Service:
         release = getattr(self.allocator, "release", None)
         if self.s.role != "client" or release is None or self.switcher is None or self.dry_run:
             return
-        try:
-            mac = self.switcher.current_mac()
-            if release(mac):
-                self.bus.emit("info", f"已通知伺服器釋放 {fmt(mac)}，其他電腦可以使用")
-        except Exception as e:
-            self.bus.emit("info", f"沒能通知伺服器釋放租約（{e}）；約 {self.s.lease_ttl_s:.0f} 秒後租約逾時也會空出")
+        out: dict = {}
+
+        def work() -> None:
+            try:
+                mac = self.switcher.current_mac()
+                out["mac"], out["ok"] = mac, release(mac)
+            except Exception as e:
+                out["err"] = e
+
+        th = threading.Thread(target=work, name="automac-release", daemon=True)
+        th.start()
+        th.join(timeout=2.5)                           # 總共最多等 2.5 秒：伺服器網址有好幾個、各自逾時 3 秒時也不能拖住關機或關視窗
+        if th.is_alive() or "err" in out:
+            why = "逾時" if th.is_alive() else out["err"]
+            self.bus.emit("info", f"沒能通知伺服器釋放租約（{why}）；約 {self.s.lease_ttl_s:.0f} 秒後租約逾時也會空出")
+        elif out.get("ok"):
+            self.bus.emit("info", f"已通知伺服器釋放 {fmt(out['mac'])}，其他電腦可以使用")
 
     def stop(self) -> None:
         self._stop.set()
@@ -462,9 +473,13 @@ class Service:
         new = [PoolEntry(p["mac"], p.get("plabel", p["label"]), p["fixed"]) for p in view["pool"]]   # 快取存 MAC 自己的標籤，不存「目前是誰在用」
         changed = [(e.mac, e.label, e.fixed) for e in new] != [(e.mac, e.label, e.fixed) for e in self.s.pool]
         self.s.pool = new
+        hub_throttled = set(view.get("throttled", {}))
+        for m in getattr(self, "_hub_throttled", set()) - hub_throttled:
+            self.state.clear_throttled(m)                  # 伺服器已清除這個標記（誤判或限速提早結束）：本機的副本跟著清，不然要等到隔天
         for m, u in view.get("throttled", {}).items():     # 備援用：伺服器連不上時也不會選到已知被限速的
             if not self.state.throttled_until_of(m, self.wall()):
                 self.state.mark_throttled(m, u)
+        self._hub_throttled = hub_throttled
         self._hub_view = (self.wall(), view)
         if changed:
             if self.config_path:
@@ -626,6 +641,24 @@ class Service:
         if self._exec is None:
             return work()
         return self._exec.submit(work)
+
+    def clear_throttle(self, mac: str) -> bool:
+        """清除某個 MAC 的限速標記（誤判、或限速提早結束時用）。組員端請伺服器清掉全員共用的那份（舊版伺服器不認得就只清本機，
+        並說明），再清本機副本；伺服器與單機直接清自己的登記。回傳原本是否有標記。"""
+        m = normalize(mac)
+        had = self.state.throttled_until_of(m, self.wall()) is not None
+        if self.s.role == "client" and self.allocator is not None:
+            try:
+                had = bool(self.allocator.unthrottle(m)) or had
+            except HubError as e:
+                self.bus.emit("warn", f"伺服器沒有清除 {fmt(m)} 的限速標記（{e}）；只清了這台電腦的，其他電腦與伺服器上的仍在")
+        elif self.hub is not None:
+            had = self.hub.unthrottle(m) or had
+        self.state.clear_throttled(m)
+        if hasattr(self, "_hub_throttled"):
+            self._hub_throttled.discard(m)
+        self.bus.emit("info", f"已清除 {fmt(m)} 的限速標記" if had else f"{fmt(m)} 沒有限速標記")
+        return had
 
     def probe_now(self) -> None:
         """使用者按「立即檢查」：不管流量與排程，直接探一次（結果仍照一般規則處理）。"""

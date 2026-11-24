@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -453,7 +454,7 @@ class TestLiveCommand(unittest.TestCase):
         from automac.localapi import LocalServer, load_or_create_token
         with tempfile.TemporaryDirectory() as td:
             cfg = Path(td) / "config.json"
-            s = Settings(role="client", hub_token="t" * 32, hub_cert_sha256="a" * 64, local_api=True)
+            s = Settings(role="client", hub_token="t" * 32, hub_cert_sha256="a" * 64, local_api=True, use_presence=False)
             s.add_mac(A)
             s.add_mac(B)
             clock = Clock()
@@ -712,6 +713,264 @@ class TestPoolSettingsPersist(unittest.TestCase):
             back.find(A).fixed = False
             config.save(back, path)
             self.assertFalse(config.load(path).find(A).fixed)
+
+
+class TestThrottleMarks(unittest.TestCase):
+    """限速標記是全員共用的：誤判或限速提早結束時要能清掉，而且各台電腦的本機副本要跟著清；手動指定的 MAC 不該被擋。"""
+
+    def hub(self):
+        from tests.test_p8_hub import make_hub
+        hub, s, st, clock, td = make_hub(pool=(A, B, C_MAC))
+        self.addCleanup(td.cleanup)
+        return hub
+
+    def test_hub_unthrottle_clears_only_that_mac(self):
+        hub = self.hub()
+        hub.state.mark_throttled(B, hub.wall() + 3600)
+        hub.state.mark_throttled(C_MAC, hub.wall() + 3600)
+        self.assertTrue(hub.unthrottle(B))
+        self.assertFalse(hub.unthrottle(B))                              # 已經清掉：回傳 False，不報錯
+        self.assertEqual(list(hub.view("x", A)["throttled"]), [C_MAC])
+
+    def test_manual_pick_of_throttled_mac_is_allowed_but_fixed_and_in_use_are_refused(self):
+        from automac.hub import HubError
+        hub = self.hub()
+        hub.state.mark_throttled(B, hub.wall() + 3600)
+        self.assertEqual(hub.allocate("pc", "pc", A, want=B), B)         # 使用者明確指定：照辦
+        hub.report("other", "other", C_MAC, "192.0.2.9")
+        with self.assertRaises(HubError):
+            hub.allocate("pc", "pc", A, want=C_MAC)                      # 別台持有：仍然擋
+        hub.s.find(A).fixed = True
+        with self.assertRaises(HubError):
+            hub.allocate("pc", "pc", B, want=A)                          # 固定占用：仍然擋
+
+    def test_automatic_pick_still_avoids_throttled(self):
+        from automac.hub import HubError
+        hub = self.hub()
+        hub.state.mark_throttled(B, hub.wall() + 3600)
+        hub.state.mark_throttled(C_MAC, hub.wall() + 3600)
+        with self.assertRaises(HubError):
+            hub.allocate("pc", "pc", A)                                  # 其餘都被標限速：自動挑選沒有可用的
+
+    def test_http_unthrottle_roundtrip(self):
+        from automac.hub import HubClient, HubServer
+        from tests.test_p8_hub import CERT, KEY, PIN, TOKEN, HAVE_OPENSSL
+        if not HAVE_OPENSSL:
+            self.skipTest("找不到 openssl")
+        hub = self.hub()
+        hub.state.mark_throttled(B, hub.wall() + 3600)
+        srv = HubServer(hub, TOKEN, CERT, KEY, port=0, host="127.0.0.1")
+        srv.start()
+        self.addCleanup(srv.stop)
+        c = HubClient(lambda: f"https://127.0.0.1:{srv.port}", TOKEN, "pc", PIN)
+        self.assertTrue(c.unthrottle(B))
+        self.assertEqual(hub.view("pc", A)["throttled"], {})
+
+    def _svc(self, role="client"):
+        clock = Clock()
+        s = Settings(role=role, hub_token="t" * 32, hub_cert_sha256="a" * 64, use_presence=False)
+        s.add_mac(A)
+        s.add_mac(B)
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        svc = Service(s, StateStore(Path(td.name) / "st.json"), FakeNic(A), EventBus(clock=clock), synchronous=True,
+                      sampler=FakeSampler(clock), probe_fn=Probe([GOOD]), scan_fn=lambda: [], clock=clock, wall=clock,
+                      sleep=clock.sleep)
+        svc.start()
+        return svc, clock
+
+    @staticmethod
+    def _view(clock, throttled):
+        row = {"label": "", "plabel": "", "fixed": False}
+        return {"ts": clock(), "pool": [{"mac": A, **row}, {"mac": B, **row}], "throttled": throttled}
+
+    def test_client_follows_hub_when_mark_is_cleared(self):
+        # 本機副本跟著伺服器：伺服器清掉後，各台電腦不必等到隔天
+        svc, clock = self._svc()
+        svc._apply_view(self._view(clock, {B: clock() + 7200}))
+        self.assertIsNotNone(svc.state.throttled_until_of(B, clock()))
+        svc._apply_view(self._view(clock, {}))
+        self.assertIsNone(svc.state.throttled_until_of(B, clock()))        # 伺服器清了，本機跟著清
+
+    def test_locally_detected_mark_survives_hub_sync(self):
+        svc, clock = self._svc()
+        svc.state.mark_throttled(B, clock() + 7200)                        # 本機自己偵測到的（不是伺服器給的）
+        svc._apply_view(self._view(clock, {}))
+        self.assertIsNotNone(svc.state.throttled_until_of(B, clock()))
+
+    def test_service_clear_throttle_for_client_and_old_server(self):
+        from automac.hub import HubError
+        svc, clock = self._svc()
+        svc.state.mark_throttled(B, clock() + 7200)
+        rec = mock.Mock()
+        rec.unthrottle.return_value = True
+        svc.allocator = rec
+        self.assertTrue(svc.clear_throttle(B))
+        rec.unthrottle.assert_called_once_with(B)
+        self.assertIsNone(svc.state.throttled_until_of(B, clock()))
+        svc.state.mark_throttled(B, clock() + 7200)
+        rec.unthrottle.side_effect = HubError("未知路徑")                    # 舊版伺服器：只清本機，並說清楚
+        svc.clear_throttle(B)
+        self.assertIsNone(svc.state.throttled_until_of(B, clock()))
+        self.assertTrue(any("只清了這台電腦的" in e.message for e in svc.bus.recent(50)))
+
+    def test_manual_switch_to_throttled_mac_warns_and_proceeds(self):
+        svc, clock = self._svc(role="standalone")
+        svc.state.mark_throttled(B, clock() + 7200)
+        svc.switch_now(B)
+        self.assertEqual(svc.nic.calls, [B])
+        self.assertTrue(any("先前被標為限速" in e.message for e in svc.bus.recent(50)))
+
+    def test_manual_switch_proceeds_when_old_server_refuses_throttled_mac(self):
+        # 舊版伺服器對「已知限速」的 MAC 一律拒絕，連手動指定也是；新客戶端在這種情況下改用本機檢查照辦
+        from automac.hub import HubError
+        svc, clock = self._svc(role="client")
+        svc.state.mark_throttled(B, clock() + 7200)
+        svc.allocator = svc.switcher.allocator = mock.Mock()
+        svc.allocator.allocate.side_effect = HubError("00-00-5E-00-53-02 目前不可用：已知被限速（已知被限速）")
+        svc.switch_now(B)
+        self.assertEqual(svc.nic.calls, [B])
+        self.assertTrue(any("依你的選擇改用本機檢查" in e.message for e in svc.bus.recent(50)))
+
+    def test_old_server_refusal_for_other_reasons_still_blocks(self):
+        from automac.hub import HubError
+        svc, clock = self._svc(role="client")
+        svc.state.mark_throttled(B, clock() + 7200)
+        svc.allocator = svc.switcher.allocator = mock.Mock()
+        svc.allocator.allocate.side_effect = HubError("00-00-5E-00-53-02 目前不可用：他人使用中（pc）")
+        svc.switch_now(B)
+        self.assertEqual(svc.nic.calls, [])                                   # 別人在用：不是限速造成的拒絕，仍然擋
+
+    def test_cli_unthrottle_without_service_clears_local_state_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = Path(td) / "config.json"
+            config.save(Settings(), cfg)
+            st = StateStore(Path(td) / "state.json")
+            st.mark_throttled(B, time.time() + 3600)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(cli.main(["--config", str(cfg), "unthrottle", B]), 0)
+            self.assertIsNone(StateStore(Path(td) / "state.json").throttled_until_of(B, time.time()))
+            self.assertIn("伺服器上的標記沒有動", out.getvalue())
+
+
+class TestScanInterruptible(unittest.TestCase):
+    """視窗關閉時掃描要能被叫醒：量到過掃描進行中關視窗，主執行緒要等 3.29 秒。"""
+
+    def _patched(self):
+        net = ipaddress.ip_network("192.0.2.0/24")
+        return (mock.patch.object(scanner, "_is_linux", return_value=True),
+                mock.patch.object(scanner, "_linux_local_network", return_value=("192.0.2.10", net)),
+                mock.patch.object(scanner, "is_admin", return_value=False),
+                mock.patch.object(scanner, "sweep", return_value=0),
+                mock.patch.object(scanner, "_linux_neighbors", return_value=["x"]))
+
+    def test_stop_set_before_scan_returns_immediately(self):
+        import threading
+        ev = threading.Event()
+        ev.set()
+        ps = self._patched()
+        with ps[0], ps[1], ps[2], ps[3] as sw, ps[4]:
+            t = time.perf_counter()
+            self.assertEqual(scanner.scan("eth0", stop=ev, wait_s=5.0), [])
+            self.assertLess(time.perf_counter() - t, 0.5)
+        sw.assert_not_called()
+
+    def test_stop_during_wait_wakes_the_scan_quickly(self):
+        import threading
+        ev = threading.Event()
+        threading.Timer(0.3, ev.set).start()
+        ps = self._patched()
+        with ps[0], ps[1], ps[2], ps[3], ps[4]:
+            t = time.perf_counter()
+            self.assertEqual(scanner.scan("eth0", stop=ev, wait_s=8.0, rounds=2), [])   # 沒有 stop 要等約 8.7 秒
+            self.assertLess(time.perf_counter() - t, 1.5)
+
+    def test_without_stop_behaviour_is_unchanged(self):
+        ps = self._patched()
+        with ps[0], ps[1], ps[2], ps[3], ps[4], mock.patch.object(scanner.time, "sleep") as sl:
+            self.assertEqual(scanner.scan("eth0", wait_s=1.5, rounds=2), ["x"])
+        self.assertEqual([c.args[0] for c in sl.call_args_list], [0.7, 1.5])
+
+
+class TestWindowsScanIsFast(unittest.TestCase):
+    """Windows 的掃描原本要啟動兩次 PowerShell（各約 1.3 秒）；改用 psutil 與 arp -a，失敗退回 PowerShell。"""
+
+    ZH = ("\n介面: 192.0.2.10 --- 0x5\n  網際網路位址          實體位址               類型\n"
+          "  192.0.2.1             00-00-5e-00-53-01     動態        \n"
+          "  192.0.2.20            00-00-5E-00-53-14     動態        \n"
+          "  192.0.2.22            00-00-5e-00-53-16     靜態        \n"
+          "  192.0.2.255           ff-ff-ff-ff-ff-ff     靜態        \n"
+          "  224.0.0.22            01-00-5e-00-00-16     靜態        \n"
+          "  198.51.100.9          00-00-5e-00-53-18     動態        \n"
+          "  192.0.2.25            00-00-5e-00-53-19     動態        \n")
+    EN = ("\nInterface: 192.0.2.10 --- 0x5\n  Internet Address      Physical Address      Type\n"
+          "  192.0.2.1             00-00-5e-00-53-01     dynamic\n"
+          "  192.0.2.255           ff-ff-ff-ff-ff-ff     static\n")
+    NET = ipaddress.ip_network("192.0.2.0/24")
+
+    def test_parse_arp_a_chinese_and_english_headers(self):
+        got = scanner.parse_arp_a(self.ZH, self.NET, own_mac="00-00-5e-00-53-19")
+        self.assertEqual([(n.ip, n.mac) for n in got],
+                         [("192.0.2.1", "00005E005301"), ("192.0.2.20", "00005E005314"), ("192.0.2.22", "00005E005316")])
+        self.assertEqual([n.ip for n in scanner.parse_arp_a(self.EN, self.NET)], ["192.0.2.1"])      # 不看「動態／dynamic」欄，語言不同也行
+        self.assertEqual(scanner.parse_arp_a("找不到 ARP 項目。\n", self.NET), [])
+
+    def _scan(self, arp):
+        ps_rows = [{"IPAddress": "192.0.2.7", "LinkLayerAddress": "00-00-5E-00-53-07", "State": "Reachable"}]
+        with mock.patch.object(scanner, "_is_linux", return_value=False), \
+             mock.patch.object(scanner, "_psutil_local_network", return_value=("192.0.2.10", self.NET)), \
+             mock.patch.object(scanner, "is_admin", return_value=False), \
+             mock.patch.object(scanner, "sweep", return_value=0), \
+             mock.patch.object(scanner, "_arp_a_neighbors", side_effect=arp) as fast, \
+             mock.patch.object(scanner, "ps_json", return_value=ps_rows) as ps, \
+             mock.patch.object(scanner.time, "sleep"):
+            return scanner.scan("乙太網路", "00005E005310"), fast, ps
+
+    def test_scan_uses_arp_and_does_not_start_powershell(self):
+        res, fast, ps = self._scan(lambda ip, net, own: scanner.parse_arp_a(self.EN, net, own))
+        self.assertEqual([n.ip for n in res], ["192.0.2.1"])
+        ps.assert_not_called()                                              # 這就是省下的 2.6 秒
+
+    def test_scan_falls_back_to_powershell_when_arp_fails(self):
+        res, fast, ps = self._scan(lambda ip, net, own: None)
+        self.assertEqual([n.ip for n in res], ["192.0.2.7"])
+        ps.assert_called_once()
+
+    def test_local_network_prefers_psutil_and_shrinks_big_networks(self):
+        with mock.patch.object(scanner, "_is_linux", return_value=False), \
+             mock.patch.object(scanner, "_psutil_local_network", return_value=("10.1.2.3", ipaddress.ip_network("10.0.0.0/16"))), \
+             mock.patch.object(scanner, "ps_json") as ps:
+            self.assertEqual(scanner.local_network("x"), ("10.1.2.3", ipaddress.ip_network("10.1.2.0/24")))
+        ps.assert_not_called()
+
+    def test_local_network_falls_back_to_powershell(self):
+        with mock.patch.object(scanner, "_is_linux", return_value=False), \
+             mock.patch.object(scanner, "_psutil_local_network", return_value=None), \
+             mock.patch.object(scanner, "ps_json", return_value=[{"IPAddress": "192.0.2.10", "PrefixLength": 24}]) as ps:
+            self.assertEqual(scanner.local_network("x"), ("192.0.2.10", self.NET))
+        ps.assert_called_once()
+
+
+class TestReleaseIsBounded(unittest.TestCase):
+    def test_slow_server_cannot_hold_up_shutdown(self):
+        # 伺服器網址有好幾個、各自逾時時，總共最多等約 2.5 秒（量到過：沒上限時停止要多 3 秒以上）
+        clock = Clock()
+        s = Settings(role="client", hub_token="t" * 32, hub_cert_sha256="a" * 64)
+        s.add_mac(A)
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        svc = Service(s, StateStore(Path(td.name) / "st.json"), FakeNic(A), EventBus(clock=clock), synchronous=True,
+                      sampler=FakeSampler(clock), probe_fn=Probe([GOOD]), scan_fn=lambda: [], clock=clock, wall=clock,
+                      sleep=clock.sleep)
+        svc.start()
+        slow = mock.Mock()
+        slow.release.side_effect = lambda mac: time.sleep(10)
+        svc.allocator = slow
+        t = time.perf_counter()
+        svc.stop()
+        self.assertLess(time.perf_counter() - t, 5.0)
+        self.assertTrue(any("逾時" in e.message for e in svc.bus.recent(50)))
 
 
 if __name__ == "__main__":
