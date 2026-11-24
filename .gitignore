@@ -1,0 +1,36 @@
+# ===== 個資與機密：任何情況都不可進版本控制 =====
+# 設定檔（含真實 MAC、IP、token、憑證指紋）與執行狀態
+config.json
+state.json
+mac_settings.json
+local.token
+usage.json
+devices.json
+# 組員設定檔（含 hub_token 與伺服器憑證指紋）
+automac-client.json
+# 憑證、私鑰、金鑰、SSH 相關
+*.pem
+*.key
+*.crt
+*.pfx
+id_*
+known_hosts*
+authorized_keys*
+密鑰/
+# 日誌與擷取的網路資料（可能含 MAC、IP、主機名稱）
+*.log
+*.csv
+crash.log
+# 實驗室實測原始資料：公開庫只保留 samples/ 內已確認沒有識別資訊的樣本，新錄製的請先檢查再 git add -f
+samples/*_local*.json
+# ===== 本機環境與建置產物 =====
+.venv/
+venv/
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+.pytest_cache/
+.idea/
+.vscode/

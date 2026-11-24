@@ -1,0 +1,64 @@
+{
+  "iface": "",
+  "pool": [
+    {
+      "mac": "00005E005301",
+      "label": "實驗室電腦 A",
+      "fixed": false
+    },
+    {
+      "mac": "00005E005302",
+      "label": "實驗室電腦 B",
+      "fixed": false
+    },
+    {
+      "mac": "00005E005303",
+      "label": "",
+      "fixed": false
+    },
+    {
+      "mac": "00005E005304",
+      "label": "樹莓派（長期占用）",
+      "fixed": true
+    }
+  ],
+  "auto_mode": false,
+  "gate_mbps": 3.0,
+  "probe_low_mbps": 2.0,
+  "quiet_window_s": 10.0,
+  "recent_window_s": 3.0,
+  "idle_probe_interval_s": 180.0,
+  "confirm_strikes": 2,
+  "strike_gap_s": 5.0,
+  "strike_ttl_s": 60.0,
+  "invalid_retry_s": 10.0,
+  "flat_low_range": [
+    0.5,
+    1.8
+  ],
+  "flat_low_cv": 0.25,
+  "probe_bytes": 262144,
+  "probe_timeout_s": 15.0,
+  "probe_urls": [
+    "https://speed.cloudflare.com/__down"
+  ],
+  "min_switch_gap_s": 60.0,
+  "max_switches_per_hour": 4,
+  "quota_reset_hour": 0,
+  "adapter_wait_s": 45.0,
+  "scan_before_switch": true,
+  "use_presence": true,
+  "claim_wait_s": 1.5,
+  "sample_interval_s": 1.0,
+  "allow_hooks": false,
+  "hooks_before": [],
+  "hooks_after": [],
+  "mdns_service": "_automac._tcp.local.",
+  "role": "standalone",
+  "hub_url": "",
+  "hub_cert_sha256": "",
+  "hub_port": 47601,
+  "auto_join": true,
+  "daily_quota_gb": 10.0,
+  "hub_token": ""
+}
