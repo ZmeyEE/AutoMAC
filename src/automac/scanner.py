@@ -2,7 +2,7 @@
 
 做法（不需要 Npcap 等封包擷取驅動）
     1. 對網段內每個位址送一個 UDP 小封包到 9 號埠（discard）。目的不是通訊，而是逼作業系統先做 ARP。
-    2. 等一下，讀 Windows 鄰居表（Get-NetNeighbor），裡面就是有回 ARP 的裝置與其 MAC。
+    2. 等一下，讀鄰居表：Windows 用 Get-NetNeighbor；Linux 讀 /proc/net/arp（不需要 root，清空用 ip neigh flush 才需要）。
 為什麼不用 ping：2026-11-23 實測，ICMP 漏掉約一半的主機（有些裝置擋 ping 但會回 ARP）。
 
 限制（要誠實寫在這裡）
@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import ipaddress
 import socket
+import sys
 import time
 from dataclasses import dataclass
 from typing import Callable, Iterable
@@ -56,8 +57,65 @@ def parse_neighbors(rows: Iterable[dict], network: ipaddress.IPv4Network | None 
     return sorted(out, key=lambda n: ipaddress.ip_address(n.ip))
 
 
+def _is_linux() -> bool:
+    return sys.platform.startswith("linux")
+
+
+def parse_proc_arp(text: str, iface: str, network: ipaddress.IPv4Network | None = None,
+                   own_mac: str = "") -> list[Neighbor]:
+    """解析 Linux 的 /proc/net/arp（純函式，方便測試），只留指定網卡、已完成解析的項目。
+    欄位：IP address / HW type / Flags / HW address / Mask / Device；Flags 0x2 = 已完成、0x0 = 還在解析（沒人回），略過後者。
+    轉成 Get-NetNeighbor 的欄位格式後交給 parse_neighbors，兩個平台共用同一套過濾規則（廣播、群播、自己、網段外）。"""
+    rows = []
+    for line in text.splitlines()[1:]:
+        c = line.split()
+        if len(c) < 6 or c[5] != iface:
+            continue
+        try:
+            complete = bool(int(c[2], 16) & 0x2)
+        except ValueError:
+            continue
+        if complete:
+            rows.append({"IPAddress": c[0], "LinkLayerAddress": c[3], "State": "Reachable"})
+    return parse_neighbors(rows, network, own_mac)
+
+
+def _linux_local_network(iface: str) -> tuple[str, ipaddress.IPv4Network] | None:
+    """Linux：用 psutil 讀網卡的 IPv4 位址與子網路遮罩。"""
+    import psutil
+    for a in psutil.net_if_addrs().get(iface, []):
+        if a.family == socket.AF_INET and a.address and a.netmask and not a.address.startswith(("169.254.", "127.")):
+            return a.address, ipaddress.IPv4Network(f"{a.address}/{a.netmask}", strict=False)
+    return None
+
+
+def _linux_flush(iface: str) -> None:
+    """清空該網卡的鄰居表（需要 root），讓之後讀到的是「現在真的在線」。失敗（沒有 ip 指令、權限不足）就算了，結果會偏保守。"""
+    import shutil
+    import subprocess
+    ip = shutil.which("ip")
+    if ip:
+        try:
+            subprocess.run([ip, "-4", "neigh", "flush", "dev", iface], capture_output=True, timeout=10)
+        except Exception:
+            pass
+
+
+def _linux_neighbors(iface: str, net: ipaddress.IPv4Network, own_mac: str) -> list[Neighbor]:
+    try:
+        with open("/proc/net/arp", encoding="ascii") as f:
+            return parse_proc_arp(f.read(), iface, net, own_mac)
+    except OSError:
+        return []
+
+
 def local_network(iface: str) -> tuple[str, ipaddress.IPv4Network] | None:
     """(本機 IP, 所在網段)；網卡沒有可用 IPv4 回傳 None。網段過大（>1024 台）縮成本機所在的 /24。"""
+    if _is_linux():
+        info = _linux_local_network(iface)
+        if info and info[1].num_addresses > MAX_SWEEP_HOSTS:
+            return info[0], ipaddress.IPv4Network(f"{info[0]}/24", strict=False)
+        return info
     rows = ps_json(f"Get-NetIPAddress -InterfaceAlias {ps_quote(iface)} -AddressFamily IPv4 "
                    "-ErrorAction SilentlyContinue | Select-Object IPAddress,PrefixLength")
     for r in rows:
@@ -96,12 +154,17 @@ def scan(iface: str, own_mac: str = "", wait_s: float = 1.5, rounds: int = 2,
     if info is None:
         return []
     own_ip, net = info
-    if flush and is_admin():
+    linux = _is_linux()
+    if flush and is_admin() and linux:
+        _linux_flush(iface)
+    elif flush and is_admin():
         run_ps(f"Remove-NetNeighbor -InterfaceAlias {ps_quote(iface)} -AddressFamily IPv4 -Confirm:$false "
                "-ErrorAction SilentlyContinue")
     for i in range(rounds):                 # 兩輪：第二輪補抓第一輪 ARP 還沒回來的裝置
         sweep(net, own_ip)
         time.sleep(wait_s if i == rounds - 1 else 0.7)
+    if linux:
+        return _linux_neighbors(iface, net, own_mac)
     rows = ps_json(f"Get-NetNeighbor -InterfaceAlias {ps_quote(iface)} -AddressFamily IPv4 "
                    "-ErrorAction SilentlyContinue | Select-Object IPAddress,LinkLayerAddress,State")
     return parse_neighbors(rows, net, own_mac)

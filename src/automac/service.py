@@ -90,7 +90,7 @@ class Service:
         self._usage_pending: dict[str, list[int]] = {}
         self._last_usage = 0.0
         self.state = state or StateStore()
-        self.nic = nic or nicmod.WindowsNic()
+        self.nic = nic or nicmod.default_backend()
         self.bus = bus or EventBus()
         self.clock, self.wall, self._probe_fn, self._sleep = clock, wall, probe_fn, sleep
         self.detector = Detector(settings)

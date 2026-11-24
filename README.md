@@ -16,7 +16,7 @@ AutoMAC 是針對實驗室有線網路環境開發的 MAC 管理工具。
 
 ## 1. 環境需求
 
-- Windows 10 / 11
+- Windows 10 / 11；組員端另支援 Linux（需求見第 7 節「Linux 組員端」）
 - Python 3.11 以上
 - MAC 修改需要系統管理員權限，單純監測不需要
 - Python 依賴：`psutil`、`zeroconf`
@@ -351,6 +351,61 @@ powershell -ExecutionPolicy Bypass -File tools\build_exe.ps1
 dist\automac.exe
 ```
 
+### Linux 組員端
+
+Linux 組員端沒有視窗與系統匣，只有背景服務。功能與 Windows 組員端相同（限速偵測、自動換 MAC、陌生電腦自動入網、用量回報），用指令查看狀態。伺服器端仍然只能是 Windows。
+
+需求：
+
+- 有 systemd 的發行版（Debian、Ubuntu、Raspberry Pi OS）
+- Python 3.11 以上、`python3-venv`、`iproute2`
+- 安裝時要連網（`pip` 下載 `psutil` 與 `zeroconf`）
+- 有線網卡；無線網卡不支援
+
+打包（在任何有 Python 的機器上）。`--client-json` 是伺服器匯出的組員設定檔，內含 token：
+
+```bash
+python tools/make_linux_pkg.py --out AutoMAC-Linux.tar.gz --client-json automac-client.json
+```
+
+組員安裝：
+
+```bash
+tar -xzf AutoMAC-Linux.tar.gz
+cd AutoMAC-Linux
+sudo bash install.sh
+```
+
+`install.sh` 的步驟都寫在檔案開頭的註解。完成後會多出：
+
+| 位置 | 內容 |
+|---|---|
+| `/opt/automac/` | 程式（`lib/`）與 Python 環境（`venv/`） |
+| `/var/lib/automac/` | 設定、token、狀態與日誌，權限 0700 |
+| `/etc/systemd/system/automac-client.service` | 開機啟動的服務，只保留換 MAC 需要的權限 |
+| `/usr/local/bin/automac` | 指令 |
+
+常用指令（都要 `sudo`，因為 token 只有 root 讀得到）：
+
+| 指令 | 作用 |
+|---|---|
+| `sudo automac live` | 服務目前狀態、與伺服器同步狀況、最近事件 |
+| `sudo automac status` | 網卡與池內各 MAC 的狀態（會掃描區網） |
+| `sudo automac auto on` / `off` | 開關「被限速時自動切換」，等於 Windows 視窗的勾選方塊；設定會存檔 |
+| `sudo automac switch [MAC]` | 手動切換；不給 MAC 由伺服器挑 |
+| `journalctl -u automac-client -f` | 即時日誌 |
+| `sudo bash uninstall.sh` | 移除服務、程式與本機設定 |
+
+與 Windows 版的差異：
+
+| 項目 | Windows | Linux |
+|---|---|---|
+| 換 MAC | 寫登錄並重啟網卡驅動 | `ip link set` 的 down、address、up，再通知 NetworkManager、systemd-networkd 或 dhcpcd 重新取址 |
+| 鄰居掃描 | PowerShell 的鄰居表 | `/proc/net/arp`（清空鄰居表用 `ip neigh flush`，需要 root） |
+| 單一執行個體 | 具名互斥鎖 | `flock` 鎖檔 |
+| 重開機後 | 登錄值保留，MAC 維持 | 網卡回到硬體 MAC，服務開機後再向伺服器要一個 |
+| 介面 | 視窗、系統匣 | 指令與日誌 |
+
 ### Linux 樹莓派監視器
 
 使用以下腳本修復 NAS 掛載：
@@ -470,7 +525,7 @@ python tools/bench_tls.py
 | 模組 | 職責 |
 |---|---|
 | `macaddr`、`stats`、`config` | MAC 格式、統計、設定與狀態檔 |
-| `winshell`、`nic`、`traffic` | PowerShell、網卡偵測與切換、流量取樣 |
+| `winshell`、`nic`、`traffic` | PowerShell（Windows）、網卡偵測與切換（Windows 與 Linux）、流量取樣 |
 | `probe`、`scanner`、`presence` | 探針、鄰居掃描、mDNS 宣告及佔用協定 |
 | `detector`、`policy` | 限速狀態機、MAC 選擇與切換頻率限制 |
 | `hub` | MAC 池、租約、分配、限速共享、HTTP 介面及 Client |
@@ -479,7 +534,7 @@ python tools/bench_tls.py
 
 其他模組：
 
-`devices`、`ledger`、`localapi`、`svcinstall`、`launcher`、`tlsutil`、`takeover`、`tray`、`gui/widgets`。
+`devices`、`ledger`、`localapi`、`svcinstall`（Windows 服務）、`svc_linux`（Linux 服務）、`launcher`、`tlsutil`、`takeover`、`tray`、`gui/widgets`。
 
 ## 12. 測試
 
@@ -490,14 +545,17 @@ $env:PYTHONPATH = "src"
 python -m unittest discover -s tests -t .
 ```
 
-目前共有 **242 項測試**，涵蓋：
+目前共有 **276 項測試**，涵蓋：
 
 - 正常網路、限速及使用者下載的真實樣本重播。
 - 隨機忙碌流量持續兩小時，確認沒有誤觸探針。
 - MAC 切換失敗及回滾流程。
 - GUI 操作。
+- Linux 組員端：網卡讀取與換 MAC 的指令順序、鄰居表解析、systemd 單元、單一執行個體鎖、`live` 與 `auto` 指令（`tests/test_p14_linux.py`）。
 
 `tools/` 另外提供實機驗證腳本，包含探針、鄰居掃描、mDNS 及端到端切換。
+
+測試在 Linux 上同樣可以執行；`test_p12_tray.py` 是 Windows 專用，在 Linux 會自動略過。
 
 CI 設定檔位於 `docs/ci/test.yml`。要啟用時複製到 `.github/workflows/test.yml`。
 
@@ -534,6 +592,11 @@ python -m automac hub init --new-token
 9. **登入後系統匣圖示：** 重開機後圖示是否能正常自動出現，尚未完成實機驗證。
 10. **解除安裝：** GUI 解除安裝按鈕的完整實機操作流程，尚未完成驗證。
 11. **多帳號環境：** 同一台電腦有多個 Windows 使用者帳號時，背景服務與系統匣的行為尚未完成驗證。
+12. **Linux 實體網卡尚未實測：** Linux 組員端的實機測試在 Raspberry Pi（Debian 13）上進行，沒有 root，所以改在無特權網路命名空間內，對虛擬網卡執行真實的 `ip link set`、鄰居表與伺服器端對端流程。實體網卡改 MAC 後的驅動行為、DHCP 重新取址（NetworkManager、systemd-networkd、dhcpcd 的通知）只用假指令測試過。
+13. **Linux 服務單元：** 單元通過 `systemd-analyze verify`，沙盒選項在使用者層級的 systemd 測試過，沒有以 root 實際安裝啟動過。`install.sh` 在命名空間內以假的 `systemctl` 完整執行過一次。
+14. **Linux 版沒有連過實驗室的真實伺服器：** 端對端測試用同一命名空間內的測試伺服器；連線、憑證釘選與 token 驗證與 Windows 版共用同一份程式。
+15. **Linux 取址程式：** 使用 ifupdown 加 `dhclient` 的舊系統，網卡 down 再 up 後不一定會重新取址，換 MAC 會逾時並換回原 MAC。NetworkManager 連線若設定了 `cloned-mac-address`，重新連線時會蓋掉換過的 MAC，需改成 `preserve`。
+16. **Linux 版需要 Python 3.11 以上：** Ubuntu 22.04 內建 3.10，需要另外安裝新版 Python。
 
 ## 15. 授權
 

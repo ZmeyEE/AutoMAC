@@ -1,0 +1,46 @@
+AutoMAC Linux 組員包（內含 token，只給實驗室成員，不要上傳或轉貼）
+
+這一包是沒有視窗的背景服務版：裝好後開機自動執行，偵測被限速時自動換 MAC，沒有右下角圖示。
+想看狀態用指令（下面有）；要用視窗請用 Windows 版。
+
+需求
+- 有 systemd 的 Linux（Debian、Ubuntu、Raspberry Pi OS、Fedora）、Python 3.11 以上、ip 指令（iproute2）。
+- Debian / Ubuntu 另外需要 python3-venv：sudo apt install python3-venv
+- 安裝時需要連網（pip 會下載 psutil 與 zeroconf，約 1 MB）。
+- 只支援有線網卡；無線網卡不支援。
+
+安裝
+1. 解壓縮：tar -xzf AutoMAC-Linux.tar.gz，進入資料夾（automac-client.json 與 install.sh 在同一層）。
+2. 執行：sudo bash install.sh
+3. 腳本結束時會顯示服務狀態。之後這個資料夾可以刪掉，不影響運作。
+
+安裝腳本做的事（都在 install.sh 裡，可以先讀）
+- 程式放 /opt/automac；設定與 token 放 /var/lib/automac（只有 root 讀得到）；建立指令 /usr/local/bin/automac。
+- 建立 systemd 服務 automac-client（開機啟動、失敗 10 秒後重啟、只保留換 MAC 需要的權限）。
+- 第一次執行會自動加入實驗室伺服器並同步 MAC 清單，不需要輸入任何東西。
+
+看狀態
+- sudo automac live          目前網卡、MAC、IP、與伺服器同步狀況與最近事件
+- sudo automac status        網卡與池內各 MAC 的狀態（會掃描區網，約 3 秒）
+- journalctl -u automac-client -f    即時日誌
+- sudo systemctl status automac-client
+
+兩種情況（和 Windows 版相同）
+- 這台電腦目前的 MAC 在清單內：預設只監看。要在被限速時自動換 MAC，執行 sudo automac auto on（關掉用 off，重開機後維持）。
+- 目前的 MAC 不在清單內（沒申請的 MAC）：服務會自動向伺服器要一個沒人用的 MAC 並切換，網路會中斷數秒。
+
+手動換 MAC
+- sudo automac auto on|off         開關「被限速時自動切換」（等於 Windows 版視窗裡的勾選方塊）
+- sudo automac switch              由伺服器挑一個沒人用的
+- sudo automac switch 00:00:5e:00:53:21    指定
+- 換 MAC 只改目前運作中的網卡，不寫進設定：重開機後網卡回到硬體原本的 MAC，服務開機後會再自動入網。
+
+移除
+- sudo bash uninstall.sh（停止服務、刪程式與本機設定）。MAC 清單、標籤與用量都在伺服器上，不會遺失。
+
+注意
+- 換 MAC 時網路會中斷。若你是用 SSH 連到這台機器，連線會斷幾秒，之後自己會恢復（IP 可能變）。
+- 取得 IP 靠系統既有的網路管理程式：NetworkManager、systemd-networkd、dhcpcd 會被通知重新取址；
+  用 ifupdown 加 dhclient 的舊系統可能拿不到新位址，服務會在逾時後換回原 MAC，不會留下斷線狀態。
+- 若 NetworkManager 的連線設定有指定 cloned-mac-address，它會在重新連線時蓋掉我們換的 MAC，請改成 preserve。
+- 啟動失敗時看：journalctl -u automac-client -e

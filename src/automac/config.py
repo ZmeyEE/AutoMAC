@@ -5,13 +5,14 @@
 
 位置（固定路徑，不依賴目前工作資料夾，修掉舊工具用相對路徑的問題）：
     Windows：%APPDATA%\\AutoMAC\\config.json、state.json
-    其他系統：~/.config/automac/
+    Linux：已安裝成系統服務時是 /var/lib/automac/（只有 root 讀得到，內含 token）；否則 ~/.config/automac/
 可用環境變數 AUTOMAC_CONFIG 指定設定檔路徑；狀態檔永遠在設定檔旁邊。
 """
 from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -24,9 +25,16 @@ APP_NAME = "AutoMAC"
 
 
 # --------------------------------------------------------------------------- 路徑
+LINUX_SYSTEM_DIR = Path("/var/lib/automac")     # Linux 背景服務的資料夾（svc_linux.install 建立，權限 0700）
+
+
 def config_dir() -> Path:
     base = os.environ.get("APPDATA")
-    return Path(base) / APP_NAME if base else Path.home() / ".config" / "automac"
+    if base:
+        return Path(base) / APP_NAME
+    if sys.platform.startswith("linux") and LINUX_SYSTEM_DIR.is_dir():
+        return LINUX_SYSTEM_DIR              # 裝了系統服務：root 手動下指令與服務讀同一份設定
+    return Path.home() / ".config" / "automac"
 
 
 def default_config_path() -> Path:
@@ -34,7 +42,6 @@ def default_config_path() -> Path:
     env = os.environ.get("AUTOMAC_CONFIG")
     if env:
         return Path(env)
-    import sys
     if getattr(sys, "frozen", False):
         beside = Path(sys.executable).parent / "config.json"
         if beside.exists():
@@ -246,7 +253,6 @@ def load(path: str | Path | None = None) -> Settings:
 
 def _sidecar() -> Path | None:
     """程式旁邊（打包成 exe 時是 exe 所在資料夾，否則是目前資料夾）的 automac-client.json。"""
-    import sys
     base = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path.cwd()
     f = base / "automac-client.json"
     return f if f.is_file() else None

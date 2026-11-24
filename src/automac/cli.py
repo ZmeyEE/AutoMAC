@@ -14,7 +14,11 @@
     automac gui                    開啟視窗（內嵌服務）
     automac launch                 組員雙擊 exe：安裝／啟動背景服務與系統匣圖示並開視窗檢視
     automac tray                   系統匣圖示（登入時自動啟動）
-    automac install-service|uninstall-service   背景服務的安裝與移除
+    automac install-service|uninstall-service   背景服務的安裝與移除（Windows：排程工作；Linux：systemd 單元，需 root）
+    automac live                   Linux 無視窗版：讀背景服務的即時狀態與最近事件
+    automac auto on|off            Linux 無視窗版：開關「被限速時自動切換」
+
+Linux 組員端沒有視窗與系統匣：用 `sudo automac install-service` 裝成 systemd 服務，之後用 `automac live` 或 journalctl 看狀況。
 """
 from __future__ import annotations
 
@@ -71,10 +75,10 @@ def _setup_file_log(bus: EventBus) -> None:
 # ---------------------------------------------------------------------- 指令
 def cmd_status(args) -> int:
     s, path = _load(args)
-    n = nicmod.WindowsNic()
+    n = nicmod.default_backend()
     a = n.detect(s.iface)
     print(f"設定檔：{path}{'（尚未建立，使用預設值）' if not path.exists() else ''}")
-    print(f"網卡：{a.name}（{a.speed}）  MAC：{fmt(a.mac)}  IP：{n.current_ip(a.name)}  閘道：{n.gateway(a.name)}")
+    print(f"網卡：{a.name}{'（' + a.speed + '）' if a.speed else ''}  MAC：{fmt(a.mac)}  IP：{n.current_ip(a.name)}  閘道：{n.gateway(a.name)}")
     print(f"系統管理員：{'是' if is_admin() else '否（只能監看，無法換 MAC）'}   自動切換：{'開' if s.auto_mode else '關'}")
     for p in s.validate():
         print("設定問題：", p)
@@ -96,7 +100,7 @@ def cmd_status(args) -> int:
 
 def cmd_scan(args) -> int:
     s, _ = _load(args)
-    n = nicmod.WindowsNic()
+    n = nicmod.default_backend()
     a = n.detect(s.iface)
     t = time.perf_counter()
     res = scan_subnet(a.name, own_mac=a.mac)
@@ -110,7 +114,7 @@ def cmd_scan(args) -> int:
 
 def cmd_probe(args) -> int:
     s, _ = _load(args)
-    a = nicmod.WindowsNic().detect(s.iface)
+    a = nicmod.default_backend().detect(s.iface)
     sm = TrafficSampler(a.name, s.sample_interval_s)
     sm.step()
     time.sleep(1.5)
@@ -172,7 +176,7 @@ def cmd_hub(args) -> int:
         cert = Path(s.hub_cert_file) if s.hub_cert_file else path.parent / "hub-cert.pem"
         key = Path(s.hub_key_file) if s.hub_key_file else path.parent / "hub-key.pem"
         try:
-            ip = nicmod.WindowsNic().current_ip(nicmod.WindowsNic().detect(s.iface).name)
+            ip = nicmod.default_backend().current_ip(nicmod.default_backend().detect(s.iface).name)
         except Exception:
             ip = None
         names = [n for n in (socket.gethostname(), socket.gethostname() + ".local", ip) if n]
@@ -255,7 +259,7 @@ def cmd_switch(args) -> int:
     s, _ = _load(args)
     bus = EventBus()
     bus.subscribe(_print_event)
-    n = nicmod.WindowsNic()
+    n = nicmod.default_backend()
     a = n.detect(s.iface)
     presence = None
     if s.use_presence:
@@ -348,7 +352,7 @@ def _lower_priority() -> None:
     """背景服務用「低於正常」的優先權，不跟使用者在做的事搶 CPU。"""
     try:
         import psutil
-        psutil.Process().nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
+        psutil.Process().nice(10 if sys.platform != "win32" else psutil.BELOW_NORMAL_PRIORITY_CLASS)   # Linux：nice 10
     except Exception:
         pass
 
@@ -368,6 +372,12 @@ def cmd_launch(args) -> int:
 def cmd_install_service(args) -> int:
     from . import svcinstall
     s, path = _load(args)
+    if sys.platform.startswith("linux"):
+        from . import svc_linux
+        unit = svc_linux.install(path)
+        print(f"背景服務已安裝並啟動：{unit}")
+        print(f"查看狀態：automac live    日誌：journalctl -u {svc_linux.UNIT} -f")
+        return 0
     if not getattr(sys, "frozen", False):
         print("只有打包後的 automac.exe 能安裝背景服務", file=sys.stderr)
         return 1
@@ -377,8 +387,13 @@ def cmd_install_service(args) -> int:
 
 
 def cmd_uninstall_service(args) -> int:
-    from . import svcinstall
     s, path = _load(args)
+    if sys.platform.startswith("linux"):
+        from . import svc_linux
+        svc_linux.uninstall(path, purge=args.purge)
+        print("AutoMAC 背景服務已移除" + ("（含本機設定）" if args.purge else f"（設定與紀錄保留在 {path.parent}，要清掉請加 --purge）"))
+        return 0
+    from . import svcinstall
     svcinstall.uninstall(path.parent, purge=args.purge)
     msg = ("AutoMAC 已完整移除（含本機設定）" if args.purge else
            "背景服務與系統匣圖示已移除（設定與紀錄保留在 " + str(path.parent) + "，要清掉請加 --purge 或刪除該資料夾）")
@@ -389,6 +404,63 @@ def cmd_uninstall_service(args) -> int:
             ctypes.windll.user32.MessageBoxW(0, msg, "AutoMAC", 0x40)  # type: ignore[attr-defined]
         except Exception:
             pass
+    return 0
+
+
+def _local_caller(s: Settings, path: Path):
+    """回傳 call(路徑, 內容=None)：帶 token 呼叫本機背景服務的控制介面；讀不到 token 檔就印出原因並回傳 None。
+    GET 不給內容、POST 給字典。token 檔只有 root 讀得到，所以組員端的指令要用 sudo。"""
+    from .localapi import LOCAL_HOST, TOKEN_FILE, TOKEN_HEADER
+    import urllib.request
+    try:
+        tok = (path.parent / TOKEN_FILE).read_text(encoding="ascii").strip()
+    except OSError:
+        print(f"讀不到 {path.parent / TOKEN_FILE}：背景服務還沒執行過，或需要用 sudo 執行。", file=sys.stderr)
+        return None
+
+    def call(p: str, body: dict | None = None):
+        req = urllib.request.Request(f"http://{LOCAL_HOST}:{s.local_port}{p}", headers={TOKEN_HEADER: tok},
+                                     method="GET" if body is None else "POST",
+                                     data=None if body is None else json.dumps(body).encode("utf-8"))
+        with urllib.request.urlopen(req, timeout=3) as r:
+            return json.loads(r.read().decode("utf-8"))
+    return call
+
+
+def cmd_auto(args) -> int:
+    """無視窗版的「被限速時自動切換」開關（視窗版是勾選方塊）：透過本機控制介面通知背景服務，服務會存回設定檔，重開機後維持。"""
+    import urllib.error
+    s, path = _load(args)
+    call = _local_caller(s, path)
+    if call is None:
+        return 1
+    try:
+        call("/v1/auto", {"on": args.value == "on"})
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        print(f"背景服務沒有回應（埠 {s.local_port}）：{e}", file=sys.stderr)
+        return 1
+    print(f"已通知背景服務：被限速時自動切換 = {'開' if args.value == 'on' else '關'}")
+    return 0
+
+
+def cmd_live(args) -> int:
+    """無視窗版的即時檢視（Linux 組員端用）：問背景服務現在的狀態與最近事件。服務沒在跑就明說。"""
+    import urllib.error
+    s, path = _load(args)
+    call = _local_caller(s, path)
+    if call is None:
+        return 1
+    try:
+        st, ev = call("/v1/status")["status"], call("/v1/events?since=0")
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        print(f"背景服務沒有回應（埠 {s.local_port}）：{e}", file=sys.stderr)
+        print("檢查：systemctl status automac-client", file=sys.stderr)
+        return 1
+    mac = st.get("mac") or ""
+    print(f"狀態：{st.get('state')}   網卡：{st.get('adapter')}   MAC：{fmt(mac) if len(mac) == 12 else mac}   IP：{st.get('ip')}")
+    print(f"流量：下載 {st.get('rx', 0):.2f} Mbps  上傳 {st.get('tx', 0):.2f} Mbps   自動切換：{'開' if st.get('auto_mode') else '關'}   伺服器：{st.get('hub') or '-'}")
+    for e in ev.get("events", [])[-args.lines:]:
+        print(f"{time.strftime('%H:%M:%S', time.localtime(e.get('ts', 0)))} [{e.get('kind')}] {e.get('message')}")
     return 0
 
 
@@ -471,6 +543,12 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--no-auto", dest="auto", action="store_false")
     ru.add_argument("--duration", type=float, default=0, help="執行秒數（0 = 直到 Ctrl+C）")
     ru.set_defaults(fn=cmd_run)
+    lv = sub.add_parser("live", help="讀背景服務的即時狀態與最近事件（無視窗）")
+    lv.add_argument("--lines", type=int, default=15, help="顯示最近幾筆事件")
+    lv.set_defaults(fn=cmd_live)
+    au = sub.add_parser("auto", help="開關「被限速時自動切換」（無視窗版；需背景服務在跑）")
+    au.add_argument("value", choices=["on", "off"])
+    au.set_defaults(fn=cmd_auto)
     sub.add_parser("tray", help="系統匣圖示（右下角），登入時自動啟動").set_defaults(fn=cmd_tray)
     sub.add_parser("launch", help="組員雙擊 exe 的流程：確保背景服務在跑，開視窗檢視").set_defaults(fn=cmd_launch)
     sub.add_parser("install-service", help="安裝背景服務（排程工作，開機自動啟動）").set_defaults(fn=cmd_install_service)
@@ -494,6 +572,9 @@ def main(argv: list[str] | None = None) -> int:
         return args.fn(args)
     except (nicmod.NicError, ValueError) as e:
         print(f"錯誤：{e}", file=sys.stderr)
+        return 1
+    except PermissionError as e:                       # Linux：設定檔在 /var/lib/automac（只有 root 讀得到，內含 token）
+        print(f"錯誤：沒有權限讀寫 {e.filename}。請改用 sudo 執行。", file=sys.stderr)
         return 1
 
 

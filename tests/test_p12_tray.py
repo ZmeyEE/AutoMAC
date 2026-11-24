@@ -4,10 +4,14 @@
 import gc
 import inspect
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+
+if sys.platform != "win32":                       # 系統匣與排程工作是 Windows 專用（tray 模組載入時就呼叫 ctypes.WinDLL）
+    raise unittest.SkipTest("P12 只在 Windows 執行；Linux 的對應測試在 test_p14_linux.py")
 
 from automac import config, nic, svcinstall, tray
 from automac.config import Settings, StateStore

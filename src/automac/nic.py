@@ -155,6 +155,160 @@ class WindowsNic:
             raise NicError(f"Set-NetAdapter 失敗：{e}") from e
 
 
+class LinuxNic:
+    """Linux 實作（2026-11-24 新增，組員端用，不需要視窗）。
+
+    讀取只用 /sys/class/net、/proc/net/route 與 psutil：不需要 root、不需要 iproute2、不必解析指令輸出，
+    也因此能用假的目錄結構測試。只有「改 MAC」與「叫 DHCP 重新取址」才呼叫外部指令。
+
+    換 MAC 的流程：ip link set dev X down → address M → up，再通知網路管理程式重新取址（_kick_dhcp）。
+    為什麼要先 down：多數驅動在介面啟用中改位址會回 EBUSY。
+    Linux 的改法不會寫進設定，重開機後網卡回到硬體位址；服務開機後發現 MAC 不在池內，會依 auto_join 再向伺服器要一個。
+
+    shortcut: 只認 NetworkManager、systemd-networkd、dhcpcd 三種取址程式；用 ifupdown + dhclient 的舊系統
+    網卡 down/up 後不一定會自動重新取址，wait_ready 會逾時並換回原 MAC（不會留下斷線）。要支援就在 _kick_dhcp 加 dhclient。
+    shortcut: 實體有線網卡以「/sys/class/net/X/device 存在、type=1、不是無線」判斷；虛擬網卡（橋接、veth、docker0）
+    不會被自動挑中，但用 --iface 明確指定時照辦（方便在容器與命名空間裡測試）。
+    """
+
+    def __init__(self, sysfs: str = "/sys/class/net", proc: str = "/proc", run=None, which=None, admin=None):
+        import shutil
+        import subprocess
+        self.sysfs, self.proc = sysfs, proc
+        self._run = run or subprocess.run
+        self._which = which or shutil.which
+        self._admin = admin                     # 測試用：None = 真的檢查 root
+
+    # ---- 讀 /sys
+    def _read(self, name: str, leaf: str) -> str | None:
+        import os
+        try:
+            with open(os.path.join(self.sysfs, name, leaf), encoding="ascii") as f:
+                return f.read().strip()
+        except (OSError, UnicodeDecodeError):
+            return None
+
+    def _is_wired_physical(self, name: str) -> bool:
+        import os
+        base = os.path.join(self.sysfs, name)
+        if name == "lo" or self._read(name, "type") != "1":
+            return False
+        if os.path.exists(os.path.join(base, "wireless")) or os.path.exists(os.path.join(base, "phy80211")):
+            return False
+        return os.path.exists(os.path.join(base, "device"))       # 虛擬網卡沒有 device
+
+    def _adapter(self, name: str) -> Adapter:
+        mac = self._read(name, "address")
+        if not mac:
+            raise NicError(f"讀不到網卡 {name!r} 的 MAC")
+        oper, carrier, speed = self._read(name, "operstate"), self._read(name, "carrier"), self._read(name, "speed")
+        up = oper == "up" or (oper == "unknown" and carrier == "1")      # 部分 USB 網卡的 operstate 會一直是 unknown
+        idx = self._read(name, "ifindex")
+        return Adapter(name, normalize(mac), up, f"{speed} Mbps" if speed and speed.lstrip("-").isdigit() and int(speed) > 0 else "",
+                       int(idx) if idx and idx.isdigit() else 0)
+
+    def detect(self, hint: str = "") -> Adapter:
+        import os
+        try:
+            names = sorted(os.listdir(self.sysfs))
+        except OSError as e:
+            raise NicError(f"讀不到網卡清單 {self.sysfs}：{e}") from e
+        if hint:
+            if hint not in names:
+                raise NicError(f"找不到指定的網卡 {hint!r}；現有網卡：{[n for n in names if n != 'lo']}")
+            return self._adapter(hint)
+        wired = [self._adapter(n) for n in names if self._is_wired_physical(n)]
+        up = [a for a in wired if a.up]
+        if not up:
+            raise NicError("沒有已連線的有線網卡（請確認網路線與交換機；無線網卡不支援）")
+        return up[0]
+
+    def current_mac(self, name: str) -> str:
+        mac = self._read(name, "address")
+        if not mac:
+            raise NicError(f"讀不到網卡 {name!r} 的 MAC")
+        try:
+            return normalize(mac)
+        except ValueError as e:
+            raise NicError(f"網卡 {name!r} 的 MAC 格式不認得：{mac!r}") from e
+
+    def current_ip(self, name: str) -> str | None:
+        """第一個 IPv4 位址；略過 169.254（DHCP 沒拿到時的自動位址）與回環。"""
+        try:
+            import psutil
+            import socket
+            for a in psutil.net_if_addrs().get(name, []):
+                if a.family == socket.AF_INET and a.address and not a.address.startswith(("169.254.", "127.")):
+                    return a.address
+        except Exception:
+            pass
+        return None
+
+    def gateway(self, name: str) -> str | None:
+        """從 /proc/net/route 找該網卡的預設路由（目的地全 0）；位址是小端序十六進位。"""
+        import os
+        import socket
+        import struct
+        try:
+            with open(os.path.join(self.proc, "net", "route"), encoding="ascii") as f:
+                for line in f.read().splitlines()[1:]:
+                    c = line.split()
+                    if len(c) >= 3 and c[0] == name and c[1] == "00000000":
+                        return socket.inet_ntoa(struct.pack("<L", int(c[2], 16)))
+        except (OSError, ValueError):
+            pass
+        return None
+
+    # ---- 改 MAC
+    def _is_root(self) -> bool:
+        from .winshell import is_admin
+        return is_admin() if self._admin is None else bool(self._admin)
+
+    def _ip(self, *args: str, check: bool = True, timeout: float = 15.0):
+        ip = self._which("ip")
+        if not ip:
+            raise NicError("找不到 ip 指令（請安裝 iproute2）")
+        cp = self._run([ip, *args], capture_output=True, text=True, timeout=timeout)
+        if check and cp.returncode != 0:
+            raise NicError(f"ip {' '.join(args)} 失敗：{(cp.stderr or cp.stdout or '').strip()[:300]}")
+        return cp
+
+    def set_mac(self, name: str, mac: str) -> None:
+        """只下指令，不等待（等待由 wait_ready 負責）。任何一步失敗都先把網卡拉起來再丟 NicError，不留下停用狀態。"""
+        m = check_assignable(mac)
+        if not self._is_root():
+            raise NicError("換 MAC 需要 root 權限，請用 sudo 執行（背景服務由 systemd 以 root 啟動）")
+        self._ip("link", "set", "dev", name, "down")
+        try:
+            self._ip("link", "set", "dev", name, "address", fmt(m, ":").lower())
+        finally:
+            self._ip("link", "set", "dev", name, "up", check=False)        # 位址設失敗也要拉起來
+        self._kick_dhcp(name)
+
+    def _kick_dhcp(self, name: str) -> None:
+        """叫網路管理程式重新取址（盡力而為，失敗不影響換 MAC 本身；拿不到位址由 wait_ready 逾時並換回）。
+        多數管理程式會自己偵測到網卡 down/up 而重新取址，這裡是補一腳，縮短等待。"""
+        def sh(*cmd: str) -> int:
+            try:
+                return self._run(list(cmd), capture_output=True, text=True, timeout=10).returncode
+            except Exception:
+                return 1
+        if self._which("nmcli") and sh("nmcli", "-t", "-f", "RUNNING", "general") == 0:
+            if sh("nmcli", "-w", "0", "device", "connect", name) == 0:          # -w 0：不等啟用完成
+                return
+        if self._which("networkctl") and self._which("systemctl") and sh("systemctl", "is-active", "--quiet", "systemd-networkd") == 0:
+            if sh("networkctl", "reconfigure", name) == 0:
+                return
+        if self._which("dhcpcd"):
+            sh("dhcpcd", "-n", name)
+
+
+def default_backend() -> NicBackend:
+    """依作業系統選網卡實作：Windows 用 PowerShell，其他（Linux）用 sysfs 與 ip。呼叫端不必知道差別。"""
+    import sys
+    return WindowsNic() if sys.platform == "win32" else LinuxNic()
+
+
 def wait_ready(backend: NicBackend, name: str, expect_mac: str, timeout: float,
                sleep: Callable[[float], None] = time.sleep,
                clock: Callable[[], float] = time.monotonic, poll: float = 0.25) -> str:
