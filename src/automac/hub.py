@@ -165,6 +165,7 @@ class Hub:
     def view(self, client_id: str, mac: str, fresh: bool = False) -> dict:
         """池內每個 MAC 從 client 角度看的狀態。mac 是這台電腦目前的 MAC（會標成 current，不算被占用）。"""
         now = self.wall()
+        self._mark_over_quota(now)
         sts = classify(self.s, self.state, mac, self._in_use(client_id, self._scanned(fresh)), now)
         used = self.ledger.today(now) if self.ledger else {}
         with self._lock:
@@ -189,10 +190,26 @@ class Hub:
                 for p in self.view(client_id, mac, fresh)["pool"]]
 
     # ---- 分配
+    def _mark_over_quota(self, now: float) -> None:
+        """某個 MAC 今天的下載或上傳「其中一個」已達每日額度（使用者規則：10 GB），就標成限速直到下次重置。
+        用帳本判斷（各台電腦回報的用量加總），所以不必等被限速的那台自己偵測到。固定占用的不標（不參與輪流）。
+        shortcut: 帳本只有跑本工具的電腦的流量，沒跑的設備不計入，所以實際用量可能更高、標記可能偏晚。"""
+        s = self.s
+        if not s.quota_force_switch or s.daily_quota_gb <= 0 or self.ledger is None:
+            return
+        quota = s.daily_quota_gb * 1e9
+        for m, (rx, tx) in self.ledger.today(now).items():
+            e = s.find(m)
+            if e is None or e.fixed or max(rx, tx) < quota:
+                continue
+            if self.state.throttled_until_of(e.mac, now) is None:
+                self.state.mark_throttled(e.mac, next_quota_reset(now, s.quota_reset_hour))
+
     def allocate(self, client_id: str, host: str, mac: str, want: str | None = None) -> str:
         """替 client 挑（或確認）一個沒人用的 MAC 並預約。want=None 由政策挑；否則檢查指定的那個。
         不能分配回 HubError（訊息寫明原因）。分配與預約在同一把鎖內完成，兩台同時要不會拿到同一個。"""
         scanned = self._scanned(True)                # 掃描要數秒，放在鎖外；下面「讀租約→挑→預約」才是一個不可分割的動作
+        self._mark_over_quota(self.wall())
         with self._lock:
             sts = classify(self.s, self.state, mac, self._in_use(client_id, scanned), self.wall())
             if want:
@@ -208,7 +225,7 @@ class Hub:
                 usage = {m: rx + tx for m, (rx, tx) in self.ledger.today(self.wall()).items()} if self.ledger else None
                 cands = rank_candidates(sts, mac, usage)          # 優先今天用得最少的
                 if not cands:
-                    raise HubError("池內沒有可用的 MAC（都在使用中、被限速或固定占用）")
+                    raise HubError("池內沒有可用的 MAC（都在使用中或固定占用）")
                 pick = cands[0]
             self._pending[client_id] = Lease(pick, host, "", self.wall(), "pending")
             return pick

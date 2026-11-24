@@ -744,13 +744,26 @@ class TestThrottleMarks(unittest.TestCase):
         with self.assertRaises(HubError):
             hub.allocate("pc", "pc", B, want=A)                          # 固定占用：仍然擋
 
-    def test_automatic_pick_still_avoids_throttled(self):
+    def test_automatic_pick_prefers_unthrottled_and_throttled_come_last(self):
+        hub = self.hub()
+        hub.state.mark_throttled(B, hub.wall() + 3600)
+        self.assertEqual(hub.allocate("pc", "pc", A), C_MAC)             # 有沒被限速的：一定先選它
+        hub.release("pc", C_MAC)
+        hub._pending.clear()
+        hub.state.mark_throttled(C_MAC, hub.wall() + 3600)
+        self.assertIn(hub.allocate("pc", "pc", A), (B, C_MAC))           # 其餘都被標限速：最後輪到限速的（讓每個 MAC 都能輪流用）
+
+    def test_fixed_and_in_use_are_never_picked_even_as_last_resort(self):
         from automac.hub import HubError
         hub = self.hub()
         hub.state.mark_throttled(B, hub.wall() + 3600)
-        hub.state.mark_throttled(C_MAC, hub.wall() + 3600)
+        hub.s.find(C_MAC).fixed = True
+        hub.report("other", "other", A, "192.0.2.9")
+        self.assertEqual(hub.allocate("pc", "pc", "00005E00FFFF"), B)    # A 被別台持有、C 固定占用；只剩限速的 B → 最後手段輪到 B
+        hub.report("pc2", "pc2", B, "192.0.2.10")                        # B 也被持有了
+        hub._pending.clear()
         with self.assertRaises(HubError):
-            hub.allocate("pc", "pc", A)                                  # 其餘都被標限速：自動挑選沒有可用的
+            hub.allocate("pc3", "pc3", "00005E00FFFF")                   # 真的沒有了：固定占用與使用中的絕不選
 
     def test_http_unthrottle_roundtrip(self):
         from automac.hub import HubClient, HubServer
@@ -840,6 +853,31 @@ class TestThrottleMarks(unittest.TestCase):
         svc.allocator.allocate.side_effect = HubError("00-00-5E-00-53-02 目前不可用：他人使用中（pc）")
         svc.switch_now(B)
         self.assertEqual(svc.nic.calls, [])                                   # 別人在用：不是限速造成的拒絕，仍然擋
+
+    def test_manual_mark_throttled_marks_locally_and_reports_to_hub(self):
+        # 手動切走舊的 MAC 時，限速標記原本不會寫；使用者要能手動標，而且要通知伺服器讓全員避開
+        svc, clock = self._svc(role="client")
+        svc.allocator = svc.switcher.allocator = mock.Mock()
+        svc.mark_throttled_manual(B)
+        self.assertIsNotNone(svc.state.throttled_until_of(B, clock()))
+        svc.switcher.allocator.report.assert_called_once()
+        self.assertTrue(svc.switcher.allocator.report.call_args.args[2] or svc.switcher.allocator.report.call_args.kwargs.get("throttled"))
+        self.assertTrue(any("已標記" in e.message for e in svc.bus.recent(50)))
+
+    def test_cli_throttle_and_local_api_route(self):
+        from automac.localapi import LocalServer, load_or_create_token
+        with tempfile.TemporaryDirectory() as td:
+            cfg = Path(td) / "config.json"
+            svc, clock = self._svc(role="standalone")
+            srv = LocalServer(svc, load_or_create_token(Path(td)), port=0)
+            srv.start()
+            self.addCleanup(srv.stop)
+            s = Settings()
+            s.local_port = srv.port
+            config.save(s, cfg)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(cli.main(["--config", str(cfg), "throttle", B]), 0)
+            self.assertIsNotNone(svc.state.throttled_until_of(B, clock()))
 
     def test_cli_unthrottle_without_service_clears_local_state_file(self):
         with tempfile.TemporaryDirectory() as td:
@@ -950,6 +988,131 @@ class TestWindowsScanIsFast(unittest.TestCase):
              mock.patch.object(scanner, "ps_json", return_value=[{"IPAddress": "192.0.2.10", "PrefixLength": 24}]) as ps:
             self.assertEqual(scanner.local_network("x"), ("192.0.2.10", self.NET))
         ps.assert_called_once()
+
+
+class TestQuotaRule(unittest.TestCase):
+    """使用者規則：下載或上傳「其中一個」達 10 GB（不是加總）→ 標記限速到重置，並強制切走；限速的 MAC 排最後輪替。"""
+    GB = 10 ** 9
+
+    def test_rank_puts_throttled_last_and_keeps_rotation(self):
+        from automac.config import Settings, StateStore
+        from automac.policy import classify, rank_candidates
+        s = Settings()
+        macs = ["00005E005301", "00005E005302", "00005E005303", "00005E005304", "00005E005305"]
+        for m in macs:
+            s.add_mac(m)
+        with tempfile.TemporaryDirectory() as td:
+            st = StateStore(Path(td) / "st.json")
+            st.mark_throttled(macs[1], 9999)
+            st.mark_throttled(macs[3], 9999)
+            sts = classify(s, st, macs[0], {}, 1000.0)
+            self.assertEqual(rank_candidates(sts, macs[0]), [macs[2], macs[4], macs[1], macs[3]])     # 沒被限速的先，限速的最後
+            usage = {macs[1]: 5, macs[3]: 1, macs[2]: 9, macs[4]: 2}
+            self.assertEqual(rank_candidates(sts, macs[0], usage), [macs[4], macs[2], macs[3], macs[1]])  # 各自依今天用量少的先
+            s.find(macs[3]).fixed = True
+            sts = classify(s, st, macs[0], {macs[4]: "x"}, 1000.0)
+            self.assertEqual(rank_candidates(sts, macs[0]), [macs[2], macs[1]])                        # 固定占用與使用中的不選
+
+    def _hub_with_usage(self, rx, tx, fixed=False, enabled=True):
+        from tests.test_p8_hub import make_hub
+        hub, s, st, clock, td = make_hub(pool=(A, B, C_MAC))
+        self.addCleanup(td.cleanup)
+        s.quota_force_switch = enabled
+        s.find(B).fixed = fixed
+        from automac.ledger import Ledger
+        hub.ledger = Ledger(Path(td.name) / "usage.json", 0, clock=hub.wall)
+        hub.ledger.add(B, rx, tx, hub.wall())
+        return hub
+
+    def test_hub_marks_when_either_direction_reaches_quota(self):
+        for rx, tx in ((10 * self.GB, 0), (0, 10 * self.GB), (12 * self.GB, 3 * self.GB)):
+            hub = self._hub_with_usage(rx, tx)
+            self.assertIn(B, hub.view("x", A)["throttled"], (rx, tx))
+        hub = self._hub_with_usage(int(9.99 * self.GB), int(9.99 * self.GB))        # 兩個加起來快 20 GB，但各自都沒到
+        self.assertEqual(hub.view("x", A)["throttled"], {})
+
+    def test_hub_does_not_mark_fixed_or_when_disabled_and_mark_ends_at_reset(self):
+        self.assertEqual(self._hub_with_usage(11 * self.GB, 0, fixed=True).view("x", A)["throttled"], {})
+        self.assertEqual(self._hub_with_usage(11 * self.GB, 0, enabled=False).view("x", A)["throttled"], {})
+        from automac.config import next_quota_reset
+        hub = self._hub_with_usage(11 * self.GB, 0)
+        self.assertEqual(hub.view("x", A)["throttled"][B], next_quota_reset(hub.wall(), 0))       # 直到每天預設重置
+
+    def _svc(self, usage, mac=A, auto=True, fixed=(), pool=(A, B, C_MAC), role="standalone", throttled=()):
+        clock = Clock()
+        s = Settings(role=role, auto_mode=auto, use_presence=False, hub_token="t" * 32, hub_cert_sha256="a" * 64)
+        for m in pool:
+            s.add_mac(m)
+        for m in fixed:
+            s.find(m).fixed = True
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        svc = Service(s, StateStore(Path(td.name) / "st.json"), FakeNic(mac), EventBus(clock=clock), synchronous=True,
+                      sampler=FakeSampler(clock), probe_fn=Probe([GOOD]), scan_fn=lambda: [], clock=clock, wall=clock,
+                      sleep=clock.sleep, config_path=Path(td.name) / "config.json")
+        svc.start()
+        for m in throttled:
+            svc.state.mark_throttled(m, clock() + 7200)
+        if svc.ledger is not None:
+            svc.ledger.add(mac, usage[0], usage[1], clock())
+        return svc, clock
+
+    def test_force_switch_when_download_or_upload_reaches_quota(self):
+        for usage in ((10 * self.GB, 0), (0, 10 * self.GB), (11 * self.GB, 12 * self.GB)):
+            svc, clock = self._svc(usage)
+            svc._maybe_quota_switch(clock())
+            self.assertEqual(len(svc.nic.calls), 1, usage)                                         # 強制切走
+            self.assertNotEqual(svc.nic.calls[0], A)
+            self.assertIsNotNone(svc.state.throttled_until_of(A, clock()), usage)                  # 舊的被標限速
+            self.assertTrue(any("任一方向已達每日額度" in e.message for e in svc.bus.recent(50)))
+
+    def test_no_force_switch_below_quota_even_if_sum_exceeds(self):
+        svc, clock = self._svc((int(6 * self.GB), int(6 * self.GB)))                            # 加總 12 GB，但各自 6 GB
+        svc._maybe_quota_switch(clock())
+        self.assertEqual(svc.nic.calls, [])
+
+    def test_force_switch_skips_fixed_and_respects_auto_off_and_handles_once(self):
+        svc, clock = self._svc((11 * self.GB, 0), fixed=[A])
+        svc._maybe_quota_switch(clock())
+        self.assertEqual(svc.nic.calls, [])                                                       # 固定占用不適用
+        svc, clock = self._svc((11 * self.GB, 0), auto=False)
+        svc._maybe_quota_switch(clock())
+        self.assertEqual(svc.nic.calls, [])                                                       # 使用者關了自動切換：只標記、提醒
+        self.assertIsNotNone(svc.state.throttled_until_of(A, clock()))
+        n = len(svc.bus.recent(200))
+        clock.t += 60
+        svc._maybe_quota_switch(clock())
+        self.assertEqual(len(svc.bus.recent(200)), n)                                             # 同一個 MAC 同一天不重複處理
+
+    def test_no_switch_when_every_other_mac_is_throttled_or_busy(self):
+        svc, clock = self._svc((11 * self.GB, 0), throttled=[B, C_MAC])
+        svc._maybe_quota_switch(clock())
+        self.assertEqual(svc.nic.calls, [])                                                       # 切過去只是在限速的之間跳
+        self.assertIsNotNone(svc.state.throttled_until_of(A, clock()))
+        self.assertTrue(any("沒有其他沒被限速的 MAC 可切" in e.message for e in svc.bus.recent(50)))
+
+    def test_client_uses_hub_view_usage_and_can_be_disabled(self):
+        svc, clock = self._svc((0, 0), role="client")
+        row = {"label": "", "plabel": "", "fixed": False, "kind": "free", "detail": "", "until": None, "holder": ""}
+        pool = [{"mac": A, **row, "rx": 0, "tx": 10 * self.GB}, {"mac": B, **row, "rx": 0, "tx": 0}, {"mac": C_MAC, **row, "rx": 0, "tx": 0}]
+        svc._apply_view({"ts": clock(), "pool": pool, "throttled": {}})
+        svc.allocator = svc.switcher.allocator = None
+        svc._maybe_quota_switch(clock())
+        self.assertEqual(len(svc.nic.calls), 1)
+        svc2, clock2 = self._svc((0, 0), role="client")
+        svc2.s.quota_force_switch = False
+        svc2._apply_view({"ts": clock2(), "pool": pool, "throttled": {}})
+        svc2._maybe_quota_switch(clock2())
+        self.assertEqual(svc2.nic.calls, [])
+
+    def test_auto_switch_falls_back_to_throttled_only_as_last_resort_and_says_so(self):
+        svc, clock = self._svc((0, 0), throttled=[B, C_MAC])
+        res = svc.switcher.auto_switch("throttled")
+        self.assertTrue(res.ok)
+        self.assertIn(res.new_mac, (B, C_MAC))
+        self.assertTrue(any("最後手段" in e.message for e in svc.bus.recent(50)))
+        svc2, _ = self._svc((0, 0), throttled=[B])
+        self.assertEqual(svc2.switcher.auto_switch("throttled").new_mac, C_MAC)                   # 有沒被限速的就不碰限速的
 
 
 class TestReleaseIsBounded(unittest.TestCase):

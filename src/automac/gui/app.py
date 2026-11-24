@@ -114,7 +114,7 @@ class App(tk.Tk):
         btns = ttk.Frame(mid)
         btns.pack(side="right", fill="y", padx=8, pady=8)
         edit = [("新增…", self._add), ("刪除所選", self._remove), ("編輯標籤…", self._edit_label), ("切換固定占用", self._toggle_fixed),
-                ("清除限速標記", self._clear_throttle)]
+                ("標記為限速", self._mark_throttled), ("清除限速標記", self._clear_throttle)]
         self._switch_btns = []
         self._switch_text = {}
         # 切換按鈕在最上面，自動挑選又在切換到所選之上（使用者要求：自動挑選是主要操作）
@@ -214,7 +214,7 @@ class App(tk.Tk):
         edit.pack(fill="x", pady=(6, 0))
         manage = [] if client else [("新增…", self._add), ("刪除所選", self._remove), ("編輯標籤…", self._edit_label),
                                     ("切換固定占用", self._toggle_fixed), ("重新掃描", lambda: self.refresh_pool(force=True))]
-        for text, cmd in (*manage, ("清除限速標記", self._clear_throttle)):
+        for text, cmd in (*manage, ("標記為限速", self._mark_throttled), ("清除限速標記", self._clear_throttle)):
             RoundButton(edit, text, cmd, bg=SMALL, hover=SMALL_HOVER, size=9, bold=False, width=104 if "限速" in text else 92,
                         height=28, radius=10).pack(side="left", padx=(0, 6))
 
@@ -335,6 +335,23 @@ class App(tk.Tk):
             except Exception as e:
                 self._refreshing = False
                 self.bus.emit("error", f"更新池內狀態失敗：{e}")
+        th = threading.Thread(target=work, daemon=True)
+        self._threads = [x for x in getattr(self, "_threads", []) if x.is_alive()] + [th]
+        th.start()
+
+    def _mark_throttled(self) -> None:
+        """把所選 MAC 標成限速（全員共用，之後自動挑選會避開）：看得出來它被限速、偵測還沒判定時用。"""
+        mac = self._selected_mac()
+        if not mac:
+            messagebox.showinfo("標記限速", "請先在清單中點選要標記的那一列。", parent=self)
+            return
+
+        def work():
+            try:
+                self.svc.mark_throttled_manual(mac)
+                self._q.put(("pool", self.svc.pool_statuses(max_age_s=0.0, force=True)))
+            except Exception as e:
+                self.bus.emit("error", f"標記限速失敗：{e}")
         th = threading.Thread(target=work, daemon=True)
         self._threads = [x for x in getattr(self, "_threads", []) if x.is_alive()] + [th]
         th.start()

@@ -87,9 +87,60 @@ class TestProbe(unittest.TestCase):
         self.assertIn("down", r.error)
 
     def test_timeout_by_slow_clock(self):
+        # 連上了卻讀不完（資料階段逾時）：不是斷線，而是「有效但極慢」，要算進限速判斷
         r = run_probe(Settings(probe_timeout_s=1.0), FakeMeter(1, 0), opener_ok(), FakeClock(5.0))
-        self.assertFalse(r.ok)
-        self.assertIn("TimeoutError", r.error)
+        self.assertTrue(r.ok)
+        self.assertTrue(r.valid)
+        self.assertLess(r.mbps, 2.0)
+        self.assertIn("傳輸逾時", r.error)
+
+    def test_read_timeout_after_connect_counts_as_slow_not_net_down(self):
+        # 日誌裡的 "The read operation timed out"：urllib 不包成 URLError，是連線與 TLS 都完成後等資料逾時
+        def op(req, timeout=0):
+            raise TimeoutError("The read operation timed out")
+        r = run_probe(self.cfg, FakeMeter(15, 0), op, FakeClock(0.1))
+        self.assertTrue(r.ok)
+        self.assertTrue(r.valid)
+        self.assertEqual(r.mbps, 0.0)
+        self.assertIn("The read operation timed out", r.error)
+
+    def test_read_timeout_midway_reports_actual_speed(self):
+        class Trickle(io.BytesIO):
+            def __init__(self):
+                super().__init__(b"x" * 20000)
+                self.n = 0
+
+            def read(self, k=-1):
+                self.n += 1
+                if self.n > 1:
+                    raise TimeoutError("The read operation timed out")
+                return super().read(20000)
+
+        def op(req, timeout=0):
+            return Trickle()
+        r = run_probe(self.cfg, FakeMeter(10, 0), op, FakeClock(2.0))
+        self.assertTrue(r.ok)
+        self.assertEqual(r.bytes, 20000)
+        self.assertLess(r.mbps, 1.0)
+
+    def test_connection_phase_failures_are_still_net_down(self):
+        import urllib.error
+
+        def dns(req, timeout=0):
+            raise urllib.error.URLError(OSError("Temporary failure in name resolution"))
+
+        def handshake(req, timeout=0):
+            raise urllib.error.URLError(TimeoutError("_ssl.c:1015: The handshake operation timed out"))
+        for op in (dns, handshake):
+            r = run_probe(self.cfg, FakeMeter(1, 0), op, FakeClock(0.1))
+            self.assertFalse(r.ok)
+
+    def test_slow_transfer_with_other_traffic_is_invalid(self):
+        def op(req, timeout=0):
+            raise TimeoutError("The read operation timed out")
+        r = run_probe(self.cfg, FakeMeter(15, 10 ** 8), op, FakeClock(0.1))     # 同時有大量別的流量：讀值不採用
+        self.assertTrue(r.ok)
+        self.assertFalse(r.valid)
 
     def test_url_with_existing_query(self):
         cfg = Settings(probe_urls=["https://h/x?token=1"])

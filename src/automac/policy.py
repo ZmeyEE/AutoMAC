@@ -61,10 +61,15 @@ def rank_candidates(statuses: list[MacStatus], current_mac: str, usage: dict[str
     start = (macs.index(cur) + 1) if cur in macs else 0
     order = macs[start:] + macs[:start]
     free = {s.mac for s in statuses if s.kind == "free"}
+    throttled = {s.mac for s in statuses if s.kind == "throttled"}
     out = [m for m in order if m in free]
+    last = [m for m in order if m in throttled]
     if usage:
         out.sort(key=lambda m: usage.get(m, 0))              # 穩定排序：同樣用量保持輪流順序
-    return out
+        last.sort(key=lambda m: usage.get(m, 0))
+    # 被標限速的 MAC 排最後：沒被限速的都輪過了、或都在使用中時才輪到它。這樣每個 MAC 都有機會輪流使用
+    # （長期不用可能被學校關掉），又盡量避開限速的（2026-11-24 使用者要求）。固定占用與他人使用中的仍然不選。
+    return out + last
 
 
 class GovernorConfig(Protocol):

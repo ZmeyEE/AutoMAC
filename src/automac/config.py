@@ -112,7 +112,8 @@ class Settings:
     join_retry_s: float = 60.0           # 入網配發失敗後多久再試
     local_api: bool = True               # 背景服務是否開放本機控制介面給視窗用（localapi.py）
     local_port: int = 47602              # 本機控制介面埠（只綁 127.0.0.1）
-    daily_quota_gb: float = 10.0         # 每個 MAC 每日流量上限（使用者描述的規則，未經校方證實）；只用來顯示百分比，不會因此排除 MAC
+    daily_quota_gb: float = 10.0         # 每個 MAC 每日流量上限（使用者描述的規則，未經校方證實）：下載或上傳任一方向達到就視為被限速
+    quota_force_switch: bool = True      # 用量達額度（任一方向）就標記限速直到重置，並強制切走目前在用的；關掉就只顯示百分比
 
     # --- 偵測門檻（依 2026-11-23 實測：健康約 95 Mbps，限速約 1 Mbps）
     gate_mbps: float = 3.0               # 網卡流量低於此值才算「安靜」，可以探測

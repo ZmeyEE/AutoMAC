@@ -17,6 +17,7 @@
     automac install-service|uninstall-service   背景服務的安裝與移除（Windows：排程工作；Linux：systemd 單元，需 root）
     automac live                   Linux 無視窗版：讀背景服務的即時狀態與最近事件
     automac auto on|off            Linux 無視窗版：開關「被限速時自動切換」
+    automac throttle <MAC>         手動把某個 MAC 標成限速（偵測還沒判定、或手動切走舊的時）
     automac unthrottle <MAC>       清除某個 MAC 的限速標記（偵測誤判，或限速提早結束時）
 
 Linux 組員端沒有視窗與系統匣：用 `sudo automac install-service` 裝成 systemd 服務，之後用 `automac live` 或 journalctl 看狀況。
@@ -542,6 +543,23 @@ def cmd_unthrottle(args) -> int:
     return 0
 
 
+def cmd_throttle(args) -> int:
+    """手動把某個 MAC 標成限速：偵測還沒判定、或手動切走舊的 MAC 時用。需要背景服務在跑（要連伺服器通知全員）。"""
+    import urllib.error
+    s, path = _load(args)
+    mac = normalize(args.mac)
+    call = _local_caller(s, path)
+    if call is None:
+        return 1
+    try:
+        call("/v1/throttle", {"mac": mac})
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        print(f"背景服務沒有回應（埠 {s.local_port}）：{e}", file=sys.stderr)
+        return 1
+    print(f"已標記 {fmt(mac)} 為限速（到下次重置時間；取消用 automac unthrottle {fmt(mac)}）")
+    return 0
+
+
 def cmd_gui(args) -> int:
     from .gui import main as gui_main
     if getattr(sys, "frozen", False):                # 視窗已經開著就帶到最前面，不再開第二個（伺服器的接手模式會停背景服務，兩個視窗會互相打架）
@@ -624,6 +642,9 @@ def build_parser() -> argparse.ArgumentParser:
     lv = sub.add_parser("live", help="讀背景服務的即時狀態與最近事件（無視窗）")
     lv.add_argument("--lines", type=int, default=15, help="顯示最近幾筆事件")
     lv.set_defaults(fn=cmd_live)
+    th = sub.add_parser("throttle", help="手動把某個 MAC 標成限速")
+    th.add_argument("mac")
+    th.set_defaults(fn=cmd_throttle)
     ut = sub.add_parser("unthrottle", help="清除某個 MAC 的限速標記（偵測誤判時用）")
     ut.add_argument("mac")
     ut.set_defaults(fn=cmd_unthrottle)

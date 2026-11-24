@@ -136,6 +136,9 @@ class LocalServer:
                     elif self.path == "/v1/auto":
                         svc.set_auto(bool(b.get("on")))
                         self._send(200, {"ok": True})
+                    elif self.path == "/v1/throttle":
+                        svc.mark_throttled_manual(b.get("mac", ""))
+                        self._send(200, {"ok": True})
                     elif self.path == "/v1/unthrottle":
                         self._send(200, {"ok": True, "cleared": svc.clear_throttle(b.get("mac", ""))})
                     else:
@@ -254,6 +257,9 @@ class LocalClient:
 
     def clear_throttle(self, mac: str) -> bool:
         return bool(self._call("POST", "/v1/unthrottle", {"mac": mac}).get("cleared"))
+
+    def mark_throttled_manual(self, mac: str) -> None:
+        self._call("POST", "/v1/throttle", {"mac": mac})
 
     def stop(self) -> None:
         """關視窗：只停掉自己的輪詢，背景服務繼續跑。"""

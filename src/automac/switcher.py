@@ -99,8 +99,7 @@ class Switcher:
         if target == old:
             raise SwitchError("已經是這個 MAC")
         until = self.state.throttled_until_of(target, self.clock())
-        if until:                                   # 限速標記只是「自動挑選時避開」的建議；使用者明確指定就照辦，但說一聲
-            self.bus.emit("warn", f"{fmt(target)} 先前被標為限速（約 {time.strftime('%m/%d %H:%M', time.localtime(until))} 恢復），照你的選擇切換")
+        self._note_throttled(target, until, reason)
         hub_ok = False
         if self.allocator and not force:
             try:
@@ -116,6 +115,17 @@ class Switcher:
                 else:
                     raise SwitchError(str(e)) from e
         return self._switch(target, old, reason, force, claim=not hub_ok, check_busy=not hub_ok)
+
+    def _note_throttled(self, target: str, until: float | None, reason: str) -> None:
+        """切到一個被標為限速的 MAC 時說一聲。手動指定：照使用者的選擇；自動挑選：沒有沒被限速的可用了，
+        輪到它是最後手段（限速的 MAC 排在最後輪替，讓每個 MAC 都有機會被用到）。"""
+        if not until:
+            return
+        when = time.strftime('%m/%d %H:%M', time.localtime(until))
+        if reason == "manual":
+            self.bus.emit("warn", f"{fmt(target)} 先前被標為限速（約 {when} 恢復），照你的選擇切換")
+        else:
+            self.bus.emit("warn", f"沒有沒被限速的 MAC 可用了，輪到被標為限速的 {fmt(target)}（約 {when} 恢復）：最後手段")
 
     def _switch(self, target: str, old: str, reason: str, force: bool, claim: bool = True,
                 check_busy: bool = True) -> SwitchResult:
@@ -187,6 +197,7 @@ class Switcher:
                 return SwitchResult(False, old, detail=str(e))
             else:
                 try:
+                    self._note_throttled(mac, self.state.throttled_until_of(mac, self.clock()), reason)
                     # force：伺服器已掃描並預約，不再用本機（可能過期的）鄰居表否決；mDNS 搶佔仍會執行
                     return self._switch(check_assignable(mac), old, reason, True, claim=False, check_busy=False)
                 except SwitchError as e:
@@ -196,7 +207,7 @@ class Switcher:
         cands = rank_candidates(statuses, old)
         skipped = [(s.mac, f"{s.kind}：{s.detail}") for s in statuses if s.kind not in ("free", "current")]
         if not cands:
-            return SwitchResult(False, old, detail="池內沒有可用的 MAC（都在使用中、被限速或固定占用）", skipped=skipped)
+            return SwitchResult(False, old, detail="池內沒有可用的 MAC（都在使用中或固定占用）", skipped=skipped)
         last_err = ""
         for mac in cands[:max_attempts]:
             try:

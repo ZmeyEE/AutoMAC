@@ -41,6 +41,16 @@ class ProbeResult:
     error: str = ""
 
 
+class SlowTransfer(Exception):
+    """連上了（TCP、TLS、請求都完成），但在時限內讀不完：線路是通的，只是慢到不行。
+    和「連不上」（DNS、連線、TLS 握手失敗）是兩回事：前者是被限速的特徵，後者才可能是網路中斷。
+    2026-11-24 實測：某個 MAC 超過每日額度被壓得極慢，探針連續逾時，卻全被當成「網路中斷」而不計入限速，幾分鐘都沒切換。"""
+
+    def __init__(self, got: int, secs: float, why: str):
+        super().__init__(why)
+        self.got, self.secs, self.why = got, secs, why
+
+
 # 網卡計數器包含 TCP/IP 標頭與 TLS 握手，酬載之外要多扣一點才算「探針自己的流量」。
 # 估法：乙太網路標頭約 3%（40/1460 加 14 位元組幀頭），握手憑證鏈約 8 KB，另留一些裕度。
 OVERHEAD_RATIO = 1.05
@@ -52,14 +62,23 @@ def _fetch(url: str, want: int, timeout: float, opener, clock) -> tuple[int, flo
     t0 = clock()
     req = urllib.request.Request(url, headers={"User-Agent": "automac-probe/1"})
     got = 0
-    with opener(req, timeout=timeout) as r:
+    try:
+        resp = opener(req, timeout=timeout)
+    except TimeoutError as e:
+        # urllib 把「連線、TLS 握手」階段的錯誤包成 URLError；直接丟出來的 TimeoutError 是連線與握手都完成之後、
+        # 等回應標頭時逾時（日誌的 "The read operation timed out"）：線路通、很慢
+        raise SlowTransfer(0, clock() - t0, str(e)) from e
+    with resp as r:
         while got < want:
-            chunk = r.read(min(65536, want - got))
+            try:
+                chunk = r.read(min(65536, want - got))
+            except TimeoutError as e:
+                raise SlowTransfer(got, clock() - t0, str(e)) from e
             if not chunk:
                 break
             got += len(chunk)
             if clock() - t0 > timeout:
-                raise TimeoutError(f"探針超過 {timeout} 秒")
+                raise SlowTransfer(got, clock() - t0, f"探針超過 {timeout} 秒")
     return got, clock() - t0
 
 
@@ -78,6 +97,18 @@ def run_probe(cfg: ProbeConfig, meter: CumulativeSource | None = None,
         before = meter.cumulative() if meter else None
         try:
             got, secs = _fetch(url, want, cfg.probe_timeout_s, opener, clock)
+        except SlowTransfer as e:
+            # 連上了卻讀不完：回報實際讀到的速度（幾乎是 0），當作「有效但偏慢」；其他流量干擾仍照常判斷有效性
+            after = meter.cumulative() if meter else None
+            secs = max(e.secs, 1e-6)
+            other, valid = 0.0, False
+            if before and after:
+                dt = max(after[0] - before[0], 1e-6)
+                own = e.got * OVERHEAD_RATIO + OVERHEAD_FIXED
+                other = max(0.0, (after[1] - before[1]) - own) * 8 / dt / 1e6
+                valid = other < cfg.gate_mbps
+            return ProbeResult(True, valid, e.got * 8 / secs / 1e6, e.got, secs, other, url,
+                               f"傳輸逾時：{e.got}/{want} 位元組（{e.why}）")
         except Exception as e:  # 網路層各種錯誤（DNS、連線、TLS、逾時）統一視為「這次沒測成」
             last_err = f"{type(e).__name__}: {e}"
             continue

@@ -30,7 +30,7 @@ from .ledger import Ledger
 from .devices import DeviceLabels
 from .hub import Hub, HubClient, HubError, HubServer, HubUnreachable, LocalPort
 from .macaddr import fmt, normalize
-from .policy import MacStatus, rank_candidates
+from .policy import MacStatus, classify, rank_candidates
 from .probe import ProbeResult, run_probe
 from .scanner import scan as scan_subnet
 from .switcher import SwitchResult, Switcher
@@ -511,12 +511,17 @@ class Service:
                 self._last_usage = now
                 self.track_usage()
             self._status.strikes = self.detector.strikes
+            if now - getattr(self, "_quota_checked", -1e9) >= 10:
+                self._quota_checked = now
+                self.detector.fast_probe = self._over_quota()
             reason = None if (self._busy or self._switching) else self.detector.want_probe(now)
             if reason:
                 self._busy = True
         self._refresh_state()
         if reason:
             self._submit(self._do_probe, reason, now)
+        else:
+            self._maybe_quota_switch(now)
 
     def _submit(self, fn, *args) -> Future | None:
         if self._exec is None:
@@ -533,6 +538,71 @@ class Service:
             self.bus.emit("error", f"{getattr(fn, '__name__', 'task')} 失敗：{type(e).__name__}: {e}")
 
     # ------------------------------------------------------------------ 探針與判斷
+    def _usage_of(self, mac: str) -> tuple[int, int]:
+        """這個 MAC 今天的 (下載, 上傳) 位元組。伺服器與單機看自己的帳本，組員端看伺服器同步來的清單。"""
+        try:
+            if self.ledger is not None:
+                rx, tx = self.ledger.today(self.wall()).get(mac, (0, 0))
+                return int(rx), int(tx)
+            if self._hub_view is not None:
+                row = next((p for p in self._hub_view[1]["pool"] if p["mac"] == mac), None)
+                if row:
+                    return int(row["rx"]), int(row["tx"])
+        except Exception:
+            pass
+        return 0, 0
+
+    def _over_quota(self) -> bool:
+        """目前這個 MAC 今天的下載或上傳「其中一個」是否已達每日額度（使用者規則）。用來讓偵測器更常探測。"""
+        quota = self.s.daily_quota_gb * 1e9
+        if quota <= 0 or self.switcher is None:
+            return False
+        return max(self._usage_of(self.switcher.current_mac())) >= quota
+
+    def _maybe_quota_switch(self, now: float) -> None:
+        """額度規則（使用者要求）：目前 MAC 今天的下載或上傳任一方向達 daily_quota_gb（預設 10 GB），
+        就標記限速（到下次重置）並強制切走，不必等探針偵測。固定占用的 MAC 不適用。每 15 秒檢查一次。"""
+        s = self.s
+        if not s.quota_force_switch or s.daily_quota_gb <= 0 or self.switcher is None:
+            return
+        if now - getattr(self, "_quota_enf_checked", -1e9) < 15:
+            return
+        self._quota_enf_checked = now
+        mac = self.switcher.current_mac()
+        entry = s.find(mac)
+        if entry is None or entry.fixed:
+            return
+        rx, tx = self._usage_of(mac)
+        if max(rx, tx) < s.daily_quota_gb * 1e9:
+            return
+        key = (mac, cfgmod.next_quota_reset(self.wall(), s.quota_reset_hour))
+        if getattr(self, "_quota_handled", None) == key:
+            return
+        with self._dlock:
+            if self._busy or self._switching:
+                return
+            self._busy = True
+        self._submit(self._do_quota_switch, now, mac, key, rx, tx)
+
+    def _do_quota_switch(self, now: float, mac: str, key: tuple, rx: int, tx: int) -> None:
+        try:
+            s = self.s
+            assert self.switcher is not None
+            detail = f"今天下載 {rx / 1e9:.2f} GB、上傳 {tx / 1e9:.2f} GB，任一方向已達每日額度 {s.daily_quota_gb:g} GB"
+            self._status.last_verdict = Verdict("throttled", 0, detail)
+            if not any(x.kind == "free" for x in classify(s, self.state, mac, {}, self.wall())):
+                # 其他 MAC 都被標限速、使用中或固定占用：切過去只是在限速的之間跳來跳去。只標記，維持目前的
+                self.switcher.mark_throttled(mac)
+                self.bus.emit("warn", f"{fmt(mac)} {detail}，已標記限速；但沒有其他沒被限速的 MAC 可切，維持目前的")
+                self._quota_handled = key
+                return
+            self._on_throttled(now)
+            if self.switcher.current_mac() != mac or not s.auto_mode or self._halted or self.dry_run:
+                self._quota_handled = key                # 已切走，或使用者關了自動切換／輪流已停止：不重複處理
+        finally:
+            with self._dlock:
+                self._busy = False
+
     def _do_probe(self, reason: str, now: float) -> None:
         try:
             r: ProbeResult = self._probe_fn(self.s, self.sampler)
@@ -641,6 +711,15 @@ class Service:
         if self._exec is None:
             return work()
         return self._exec.submit(work)
+
+    def mark_throttled_manual(self, mac: str) -> None:
+        """手動把某個 MAC 標成限速（使用者看得出來它被限速、偵測還沒判定，或手動切走時）。
+        和偵測判定限速時同一條路：記在本機，並回報伺服器讓全員的自動挑選避開它，到下次重置時間為止。
+        限速標記原本只有偵測判定時才寫入，手動切換不會標舊的 MAC（2026-11-24 使用者回報：切走了舊的卻沒被標）。"""
+        assert self.switcher is not None
+        m = normalize(mac)
+        self.switcher.mark_throttled(m)
+        self.bus.emit("info", f"已標記 {fmt(m)} 為限速，之後自動挑選會避開它（要取消請用「清除限速標記」）")
 
     def clear_throttle(self, mac: str) -> bool:
         """清除某個 MAC 的限速標記（誤判、或限速提早結束時用）。組員端請伺服器清掉全員共用的那份（舊版伺服器不認得就只清本機，

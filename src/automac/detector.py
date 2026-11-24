@@ -55,6 +55,7 @@ class Verdict:
 
 class Detector:
     NET_DOWN_BACKOFF_S = 15.0
+    FAST_IDLE_S = 30.0          # 今天用量已超過額度的 MAC：最可能被限速，閒置探測間隔縮短到這麼久
     FLAT_REPROBE_S = 15.0       # 平線特徵出現時，兩次探測至少隔這麼久，避免連續探
 
     def __init__(self, cfg: DetectorConfig):
@@ -67,6 +68,7 @@ class Detector:
         self._last_strike_t = 0.0
         self._next_allowed_t = 0.0                  # 無效或失敗後的退避
         self._need_verify = False                   # 剛換過 MAC，需要驗證新 MAC 是否健康
+        self.fast_probe = False                     # 由服務設定：目前 MAC 今天用量已超過額度（使用者描述的規則：超過會被限速）
 
     @property
     def strikes(self) -> int:
@@ -129,11 +131,11 @@ class Detector:
         if self._need_verify:
             return "post_switch"
         last = self._last_probe_t
-        healthy_recently = (self._last_healthy_t is not None
-                            and t - self._last_healthy_t < self.cfg.idle_probe_interval_s)
+        interval = min(self.cfg.idle_probe_interval_s, self.FAST_IDLE_S) if self.fast_probe else self.cfg.idle_probe_interval_s
+        healthy_recently = (self._last_healthy_t is not None and t - self._last_healthy_t < interval)
         if self.is_flat_low(t) and not healthy_recently and (last is None or t - last >= self.FLAT_REPROBE_S):
             return "flat_low"
-        if last is None or t - last >= self.cfg.idle_probe_interval_s:
+        if last is None or t - last >= interval:
             return "idle_interval"
         return None
 
